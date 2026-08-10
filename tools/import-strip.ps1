@@ -47,6 +47,73 @@ param(
 
 Add-Type -AssemblyName System.Drawing
 
+# Find complete connected drawings inside one row. Dividing a row into equal-width slices
+# clips long props (pitchforks, spears, shields) that cross the nominal cell boundary and can
+# even leave the clipped pixels inside the neighbouring frame. Connected components keep the
+# whole drawing together regardless of its horizontal reach.
+if (-not ("AlphaComponents" -as [type])) {
+  Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+
+public static class AlphaComponents
+{
+    public static Rectangle[] Find(byte[] pixels, int width, int height, int stride,
+                                   int y0, int y1, byte alphaFloor)
+    {
+        int bandHeight = y1 - y0 + 1;
+        var seen = new bool[width * bandHeight];
+        var queue = new int[width * bandHeight];
+        var found = new List<Tuple<Rectangle, int>>();
+
+        for (int y = y0; y <= y1; y++)
+        for (int x = 0; x < width; x++)
+        {
+            int local = (y - y0) * width + x;
+            if (seen[local] || pixels[y * stride + x * 4 + 3] <= alphaFloor) continue;
+
+            int head = 0, tail = 0, count = 0;
+            int minX = x, maxX = x, minY = y, maxY = y;
+            seen[local] = true;
+            queue[tail++] = local;
+
+            while (head < tail)
+            {
+                int p = queue[head++];
+                int px = p % width;
+                int py = p / width + y0;
+                count++;
+                if (px < minX) minX = px; if (px > maxX) maxX = px;
+                if (py < minY) minY = py; if (py > maxY) maxY = py;
+
+                if (px > 0) Visit(px - 1, py, y0, width, stride, alphaFloor, pixels, seen, queue, ref tail);
+                if (px + 1 < width) Visit(px + 1, py, y0, width, stride, alphaFloor, pixels, seen, queue, ref tail);
+                if (py > y0) Visit(px, py - 1, y0, width, stride, alphaFloor, pixels, seen, queue, ref tail);
+                if (py < y1) Visit(px, py + 1, y0, width, stride, alphaFloor, pixels, seen, queue, ref tail);
+            }
+
+            found.Add(Tuple.Create(new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1), count));
+        }
+
+        found.Sort((a, b) => b.Item2.CompareTo(a.Item2));
+        var boxes = new Rectangle[found.Count];
+        for (int i = 0; i < found.Count; i++) boxes[i] = found[i].Item1;
+        return boxes;
+    }
+
+    private static void Visit(int x, int y, int y0, int width, int stride, byte alphaFloor,
+                              byte[] pixels, bool[] seen, int[] queue, ref int tail)
+    {
+        int local = (y - y0) * width + x;
+        if (seen[local]) return;
+        seen[local] = true;
+        if (pixels[y * stride + x * 4 + 3] > alphaFloor) queue[tail++] = local;
+    }
+}
+'@
+}
+
 if (-not $OutDir) {
   $root = $PSScriptRoot
   if (-not $root) { $root = Split-Path -Parent $MyInvocation.MyCommand.Path }
@@ -105,17 +172,16 @@ try {
     }
 
     $spans = @()
+    $componentBoxes = @()
     if ($Frames -gt 0) {
-      $firstUsed = -1; $lastUsed = -1
-      for ($x = 0; $x -lt $img.Width; $x++) {
-        if ($used[$x]) { if ($firstUsed -lt 0) { $firstUsed = $x }; $lastUsed = $x }
-      }
-      if ($firstUsed -lt 0) { throw "Row $r is empty." }
-      $sliceW = ($lastUsed - $firstUsed + 1) / $Frames
-      for ($i = 0; $i -lt $Frames; $i++) {
-        $a = $firstUsed + [int][Math]::Floor($i * $sliceW)
-        $b = $firstUsed + [int][Math]::Floor(($i + 1) * $sliceW) - 1
-        $spans += ,@($a, $b)
+      $components = [AlphaComponents]::Find($bytes, $img.Width, $img.Height, $stride,
+                                             $y0, $y1, [byte]$AlphaFloor)
+      if ($components.Count -ge $Frames) {
+        # The helper returns largest first. Discard small detached glow/noise, then restore
+        # authored left-to-right frame order.
+        $componentBoxes = @($components | Select-Object -First $Frames | Sort-Object X)
+      } else {
+        throw "Row $r contains only $($components.Count) connected drawing(s); expected $Frames. Try a lower -AlphaFloor."
       }
     } else {
       $start = -1; $gap = 0
@@ -141,22 +207,28 @@ try {
     }
 
     $rowBoxes = @()
-    foreach ($span in $spans) {
-      $x0 = $span[0]; $x1 = $span[1]
-      $top = $y1 + 1; $bottom = $y0 - 1
-      for ($y = $y0; $y -le $y1; $y++) {
-        $row = $y * $stride
-        for ($x = $x0; $x -le $x1; $x++) {
-          if ($bytes[$row + $x * 4 + 3] -gt $AlphaFloor) {
-            if ($y -lt $top) { $top = $y }
-            if ($y -gt $bottom) { $bottom = $y }
-            break
+    if ($componentBoxes.Count -gt 0) {
+      foreach ($box in $componentBoxes) {
+        $rowBoxes += ,@($box.X, $box.Y, $box.Width, $box.Height)
+      }
+    } else {
+      foreach ($span in $spans) {
+        $x0 = $span[0]; $x1 = $span[1]
+        $top = $y1 + 1; $bottom = $y0 - 1
+        for ($y = $y0; $y -le $y1; $y++) {
+          $row = $y * $stride
+          for ($x = $x0; $x -le $x1; $x++) {
+            if ($bytes[$row + $x * 4 + 3] -gt $AlphaFloor) {
+              if ($y -lt $top) { $top = $y }
+              if ($y -gt $bottom) { $bottom = $y }
+              break
+            }
           }
         }
+        $bw = $x1 - $x0 + 1
+        $bh = $bottom - $top + 1
+        $rowBoxes += ,@($x0, $top, $bw, $bh)
       }
-      $bw = $x1 - $x0 + 1
-      $bh = $bottom - $top + 1
-      $rowBoxes += ,@($x0, $top, $bw, $bh)
     }
     $allBoxes += ,$rowBoxes
   }

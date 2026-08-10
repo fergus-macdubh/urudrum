@@ -3,3 +3,4 @@ dist/
 tools/shots/
 *.local
 .DS_Store
+.vite-dev.*.log

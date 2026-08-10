@@ -3,6 +3,7 @@ import { DEPOT, SUPPLY, TOWER, VIEW } from "../sim/config";
 import type { EnemyKind } from "../sim/config";
 import type { GameEvent } from "../sim/types";
 import { World } from "../sim/world";
+import { markLevelCompleted } from "../save";
 import { generateAllTextures } from "./art";
 import { C, hex } from "./palette";
 
@@ -16,7 +17,25 @@ import { C, hex } from "./palette";
 const REAL_ART: Record<string, string> = {
   terrain: "sprites/map.png",
   keep: "sprites/keep.png",
+  "ui-icon-build": "sprites/ui-icon-build.png",
+  "ui-icon-hire": "sprites/ui-icon-hire.png",
+  "ui-icon-sell": "sprites/ui-icon-sell.png",
 };
+
+const SOUND_EFFECTS = {
+  arrowFlight: { key: "sfx-arrow-flight", url: "audio/arrow-flight.mp3" },
+  arrowHit: { key: "sfx-arrow-hit", url: "audio/arrow-hit.mp3" },
+  build: { key: "sfx-build-tower", url: "audio/build-tower.mp3" },
+  uiClick: { key: "sfx-ui-click", url: "audio/ui-click.mp3" },
+  hire: [
+    { key: "sfx-hire-goblin-1", url: "audio/hire-goblin-1.mp3" },
+    { key: "sfx-hire-goblin-2", url: "audio/hire-goblin-2.mp3" },
+    { key: "sfx-hire-goblin-3", url: "audio/hire-goblin-3.mp3" },
+    { key: "sfx-hire-goblin-4", url: "audio/hire-goblin-4.mp3" },
+    { key: "sfx-hire-goblin-5", url: "audio/hire-goblin-5.mp3" },
+  ],
+  sell: { key: "sfx-sell-tower", url: "audio/sell-tower.mp3" },
+} as const;
 
 /** On-screen height of the keep. Its ramp is what the lane has to meet. */
 const KEEP_DISPLAY_HEIGHT = 150;
@@ -31,6 +50,15 @@ const DEPOT_DISPLAY_HEIGHT = 130;
  * actually happening instead of decorating the building with idle motion.
  */
 const DEPOT_GATE = { shut: 0, ajar: 2, open: 1 } as const;
+
+/** Only this source rectangle changes between the AI-drawn depot frames. */
+const DEPOT_GATE_CROP = { x: 25, y: 145, width: 88, height: 105 } as const;
+
+/** One segment per hired porter, positioned just below the depot. */
+const DEPOT_PORTER_PIP = { width: 8, height: 7, gap: 2, y: 47 } as const;
+
+/** A returning, empty porter crosses this threshold and is considered inside the depot. */
+const DEPOT_INTERIOR_RADIUS = 24;
 
 /**
  * Enemies with a hand-drawn walk cycle, as the prefix of their atlas keys.
@@ -207,6 +235,10 @@ interface PorterView {
 export class GameScene extends Phaser.Scene {
   world!: World;
 
+  private saveSlot = 0;
+  private level = 1;
+  private completionRecorded = false;
+
   private enemyViews = new Map<number, EnemyView>();
   private towerViews = new Map<number, TowerView>();
   private projectileViews = new Map<number, Phaser.GameObjects.Image>();
@@ -218,14 +250,27 @@ export class GameScene extends Phaser.Scene {
   /** Which purchase the popup is currently offering, if any. */
   private menuKind: "tower" | "porter" | "sell" | null = null;
   private menuSlotIndex: number | null = null;
+  /** Stable open-building frame; never changes while the gate animates. */
   private depotSprite!: Phaser.GameObjects.Image;
+  /** Cropped overlay containing only the moving gate. */
+  private depotGateSprite!: Phaser.GameObjects.Image;
+  private depotPorterPips: Phaser.GameObjects.Rectangle[] = [];
   private menuCostText!: Phaser.GameObjects.Text;
   private menuButton!: Phaser.GameObjects.Arc;
   private menuIcon!: Phaser.GameObjects.Image;
   private menuIconBacking!: Phaser.GameObjects.Arc;
+  /** Prevents several towers firing on the same simulation tick from clipping loudly. */
+  private lastSoundAt = new Map<string, number>();
+  private lastGoblinPhrase = -1;
 
   constructor() {
     super("Game");
+  }
+
+  init(data?: { saveSlot?: number; level?: number }): void {
+    this.saveSlot = data?.saveSlot ?? this.saveSlot;
+    this.level = data?.level ?? this.level;
+    this.completionRecorded = false;
   }
 
   /** Queue the hand-made art. Procedural drawing fills the gaps afterwards, in `create()`. */
@@ -245,6 +290,12 @@ export class GameScene extends Phaser.Scene {
       if (!this.textures.exists(key)) {
         this.load.atlas(key, `sprites/${key}.png`, `sprites/${key}.json`);
       }
+    }
+    const soundAssets = Object.values(SOUND_EFFECTS).flatMap((effect) =>
+      Array.isArray(effect) ? effect : [effect],
+    );
+    for (const effect of soundAssets) {
+      if (!this.cache.audio.exists(effect.key)) this.load.audio(effect.key, effect.url);
     }
   }
 
@@ -269,8 +320,11 @@ export class GameScene extends Phaser.Scene {
     this.projectileViews.clear();
     this.porterViews.clear();
     this.padZones = [];
+    this.depotPorterPips = [];
     this.menuSlotIndex = null;
     this.menuKind = null;
+    this.lastSoundAt.clear();
+    this.lastGoblinPhrase = -1;
 
     this.world = new World();
 
@@ -278,14 +332,50 @@ export class GameScene extends Phaser.Scene {
 
     // The depot doubles as the hire button — tapping the building you get porters from is
     // more discoverable than a HUD control tucked away in a corner.
+    const depotBottom = DEPOT.y + 30;
     this.depotSprite = this.add
-      .image(DEPOT.x, DEPOT.y + 30, "depot", `walk_${DEPOT_GATE.shut}`)
+      .image(DEPOT.x, depotBottom, "depot", `walk_${DEPOT_GATE.open}`)
       .setOrigin(0.5, 1)
       .setDepth(DEPTH.keep);
     this.depotSprite.setScale(DEPOT_DISPLAY_HEIGHT / this.depotSprite.height);
     this.depotSprite
       .setInteractive()
       .on("pointerdown", () => this.openPorterMenu());
+
+    // The three AI frames redraw the entire building slightly differently. Switching the
+    // full image made roofs, towers and the crane jump. Keep the open frame as a permanent
+    // base and overlay only the small gate area for the shut and ajar states.
+    this.depotGateSprite = this.add
+      .image(DEPOT.x, depotBottom, "depot", `walk_${DEPOT_GATE.shut}`)
+      .setOrigin(0.5, 1)
+      .setDepth(DEPTH.keep + 0.01)
+      .setScale(DEPOT_DISPLAY_HEIGHT / this.depotSprite.height)
+      .setCrop(
+        DEPOT_GATE_CROP.x,
+        DEPOT_GATE_CROP.y,
+        DEPOT_GATE_CROP.width,
+        DEPOT_GATE_CROP.height,
+      );
+
+    const porterCapacity = SUPPLY.maxPorters;
+    const porterSpan =
+      porterCapacity * DEPOT_PORTER_PIP.width +
+      (porterCapacity - 1) * DEPOT_PORTER_PIP.gap;
+    for (let i = 0; i < porterCapacity; i++) {
+      this.depotPorterPips.push(
+        this.add
+          .rectangle(
+            DEPOT.x - porterSpan / 2 + i * (DEPOT_PORTER_PIP.width + DEPOT_PORTER_PIP.gap),
+            DEPOT.y + DEPOT_PORTER_PIP.y,
+            DEPOT_PORTER_PIP.width,
+            DEPOT_PORTER_PIP.height,
+            hex(C.accent),
+          )
+          .setOrigin(0, 0.5)
+          .setStrokeStyle(1, hex(C.outline))
+          .setDepth(DEPTH.keep + 0.02),
+      );
+    }
 
     // Anchored by its foot so the ramp lands on the lane's end point, with the bulk of the
     // fortress rising up and to the right of it.
@@ -309,7 +399,13 @@ export class GameScene extends Phaser.Scene {
   }
 
   restart(): void {
-    this.scene.restart();
+    this.scene.restart({ saveSlot: this.saveSlot, level: this.level });
+  }
+
+  recordVictory(): void {
+    if (this.completionRecorded) return;
+    this.completionRecorded = true;
+    markLevelCompleted(this.saveSlot, this.level);
   }
 
   override update(_time: number, delta: number): void {
@@ -362,7 +458,8 @@ export class GameScene extends Phaser.Scene {
     // Light disc behind the icon: the turret is dark wood, and on the dark panel alone it
     // was almost invisible.
     this.menuIconBacking = this.add.circle(0, 0, 25, hex(C.stoneLight), 1);
-    this.menuIcon = this.add.image(0, 0, "towerIcon");
+    this.menuIcon = this.add.image(0, 0, "ui-icon-build");
+    this.fitMenuIcon();
 
     // Sits just outside the disc so it never overlaps the icon, with a heavy outline so it
     // stays legible against grass.
@@ -394,6 +491,7 @@ export class GameScene extends Phaser.Scene {
 
     this.menuButton.on("pointerdown", () => {
       if (this.menuKind === null) return;
+      this.playEffect(SOUND_EFFECTS.uiClick.key, 0.24);
 
       const bought =
         this.menuKind === "porter"
@@ -424,13 +522,20 @@ export class GameScene extends Phaser.Scene {
     });
   }
 
+  /** Fits painted popup art inside the backing disc without stretching its proportions. */
+  private fitMenuIcon(): void {
+    this.menuIcon.setScale(1);
+    this.menuIcon.setScale(48 / Math.max(this.menuIcon.width, this.menuIcon.height));
+  }
+
   private openPorterMenu(): void {
     if (this.world.status !== "playing") return;
     if (!this.world.canHirePorter) return; // At the cap; nothing to offer.
 
     this.menuKind = "porter";
     this.menuSlotIndex = null;
-    this.menuIcon.setTexture("porter");
+    this.menuIcon.setTexture("ui-icon-hire");
+    this.fitMenuIcon();
     this.menuCostText.setText(`${SUPPLY.porterCost}`);
     this.showMenuAt(DEPOT.x, DEPOT.y - 40);
     this.rangePreview.setVisible(false);
@@ -443,7 +548,8 @@ export class GameScene extends Phaser.Scene {
 
     this.menuKind = "sell";
     this.menuSlotIndex = slotIndex;
-    this.menuIcon.setTexture("sellIcon");
+    this.menuIcon.setTexture("ui-icon-sell");
+    this.fitMenuIcon();
     this.menuCostText.setText(`+${this.world.sellValue}`);
     this.showMenuAt(slot.x, slot.y);
     this.rangePreview.setPosition(slot.x, slot.y).setVisible(true);
@@ -458,7 +564,8 @@ export class GameScene extends Phaser.Scene {
 
     this.menuKind = "tower";
     this.menuSlotIndex = slotIndex;
-    this.menuIcon.setTexture("towerIcon");
+    this.menuIcon.setTexture("ui-icon-build");
+    this.fitMenuIcon();
     this.menuCostText.setText(`${TOWER.cost}`);
 
     this.showMenuAt(slot.x, slot.y);
@@ -673,6 +780,14 @@ export class GameScene extends Phaser.Scene {
 
       view.container.setPosition(porter.x, porter.y).setDepth(groundDepth(porter.y));
 
+      // Empty porters wait at the depot coordinate. Leaving their sprite there makes them
+      // stand motionless over the roof, so hide them once they cross the doorway. A loaded
+      // porter remains visible at the same coordinate because it is just walking back out.
+      const insideDepot =
+        porter.carrying === 0 &&
+        Math.hypot(porter.x - DEPOT.x, porter.y - DEPOT.y) <= DEPOT_INTERIOR_RADIUS;
+      view.container.setVisible(!insideDepot);
+
       const facing = walkView(porter.angle);
       const key = `${PORTER_ATLAS}-${facing}`;
       const count = frameCount(this, key);
@@ -699,7 +814,29 @@ export class GameScene extends Phaser.Scene {
 
     const frame =
       nearest < 40 ? DEPOT_GATE.open : nearest < 90 ? DEPOT_GATE.ajar : DEPOT_GATE.shut;
-    this.depotSprite.setFrame(`walk_${frame}`);
+
+    // The permanent image beneath this overlay is already the open state. Hiding the
+    // overlay therefore opens the doorway without redrawing any other part of the depot.
+    if (frame === DEPOT_GATE.open) {
+      this.depotGateSprite.setVisible(false);
+    } else {
+      this.depotGateSprite
+        .setVisible(true)
+        .setFrame(`walk_${frame}`)
+        // Phaser clears a frame-specific crop when the atlas frame changes.
+        .setCrop(
+          DEPOT_GATE_CROP.x,
+          DEPOT_GATE_CROP.y,
+          DEPOT_GATE_CROP.width,
+          DEPOT_GATE_CROP.height,
+        );
+    }
+
+    this.depotPorterPips.forEach((pip, i) => {
+      const hired = i < this.world.porters.length;
+      pip.setFillStyle(hex(hired ? C.accent : C.hpBack));
+      pip.setAlpha(hired ? 1 : 0.45);
+    });
   }
 
   private syncProjectiles(): void {
@@ -746,9 +883,11 @@ export class GameScene extends Phaser.Scene {
     switch (event.type) {
       case "fire":
         this.muzzleFlash(event.x, event.y, event.angle);
+        this.playEffect(SOUND_EFFECTS.arrowFlight.key, 0.34, 45);
         break;
       case "hit":
         this.burst("spark", event.x, event.y, 0.9);
+        this.playEffect(SOUND_EFFECTS.arrowHit.key, 0.42, 35);
         break;
       case "kill":
         this.burst("puff", event.x, event.y, 1.2);
@@ -761,6 +900,7 @@ export class GameScene extends Phaser.Scene {
         break;
       case "build":
         this.burst("puff", event.x, event.y, 1.5);
+        this.playEffect(SOUND_EFFECTS.build.key, 0.52);
         this.closeBuildMenu();
         break;
       case "deliver":
@@ -770,11 +910,13 @@ export class GameScene extends Phaser.Scene {
       case "hire":
         this.burst("puff", event.x, event.y, 1.4);
         this.floatingText(event.x, event.y - 30, "+1", C.accent);
+        this.playGoblinPhrase();
         this.closeBuildMenu();
         break;
       case "sell": {
         this.burst("puff", event.x, event.y - 20, 1.8);
         this.floatingText(event.x, event.y - 30, `+${event.refund}`, C.gold);
+        this.playEffect(SOUND_EFFECTS.sell.key, 0.52);
         this.closeBuildMenu();
         // The tower is gone from the simulation; drop its sprite with it.
         for (const [id, view] of this.towerViews) {
@@ -791,6 +933,21 @@ export class GameScene extends Phaser.Scene {
       default:
         break;
     }
+  }
+
+  private playEffect(key: string, volume: number, minimumGapMs = 0): void {
+    const now = this.time.now;
+    if (now - (this.lastSoundAt.get(key) ?? -Infinity) < minimumGapMs) return;
+    this.lastSoundAt.set(key, now);
+    this.sound.play(key, { volume });
+  }
+
+  private playGoblinPhrase(): void {
+    const count = SOUND_EFFECTS.hire.length;
+    let index = Phaser.Math.Between(0, count - 1);
+    if (count > 1 && index === this.lastGoblinPhrase) index = (index + 1) % count;
+    this.lastGoblinPhrase = index;
+    this.playEffect(SOUND_EFFECTS.hire[index]!.key, 0.64);
   }
 
   private muzzleFlash(x: number, y: number, angle: number): void {

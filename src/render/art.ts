@@ -28,8 +28,6 @@ const TAU = Math.PI * 2;
  * hard-coded at 3-5px, about three times too fat, and heavy ink swallowed the small detail.
  */
 const INK = 2;
-/** Units carry a little more ink than scenery, so they hold up over busy ground. */
-const INK_UNIT = INK * 1.25;
 
 function makeCanvas(w: number, h: number): [HTMLCanvasElement, CanvasRenderingContext2D] {
   const canvas = document.createElement("canvas");
@@ -142,100 +140,6 @@ function makePuff(): GeneratedTexture {
   return { key: "puff", canvas };
 }
 
-/**
- * Tower silhouette for the build button.
- *
- * Purpose-drawn rather than a shrunk-down frame of the real tower: at icon size the painted
- * sprite is a brown smudge, while a flat crenellated shape still reads as "tower".
- */
-function makeTowerIcon(): GeneratedTexture {
-  const size = 44;
-  const [canvas, ctx] = makeCanvas(size, size);
-  const c = size / 2;
-
-  outlined(
-    ctx,
-    () => {
-      ctx.moveTo(c - 11, c + 16);
-      ctx.lineTo(c - 8, c - 4);
-      ctx.lineTo(c + 8, c - 4);
-      ctx.lineTo(c + 11, c + 16);
-      ctx.closePath();
-    },
-    C.stoneMid,
-  );
-
-  outlined(ctx, () => ctx.rect(c - 13, c - 10, 26, 7), C.stoneLight);
-  for (const dx of [-12, -3, 6]) {
-    outlined(ctx, () => ctx.rect(c + dx, c - 17, 6, 8), C.stoneLight, INK * 0.75);
-  }
-
-  ctx.beginPath();
-  ctx.rect(c - 2, c + 2, 4, 8);
-  ctx.fillStyle = C.outline;
-  ctx.fill();
-
-  return { key: "towerIcon", canvas };
-}
-
-/** Coin with an arrow curving out of it: the dismantle-for-gold button. */
-function makeSellIcon(): GeneratedTexture {
-  const size = 44;
-  const [canvas, ctx] = makeCanvas(size, size);
-  const c = size / 2;
-
-  outlined(ctx, () => ctx.arc(c - 3, c + 2, 13, 0, TAU), C.goldDark, INK);
-  ctx.beginPath();
-  ctx.arc(c - 4, c + 1, 8, 0, TAU);
-  ctx.fillStyle = C.gold;
-  ctx.fill();
-
-  ctx.strokeStyle = C.outline;
-  ctx.lineWidth = INK * 1.2;
-  ctx.lineCap = "round";
-  ctx.beginPath();
-  ctx.moveTo(c + 4, c - 4);
-  ctx.quadraticCurveTo(c + 14, c - 10, c + 15, c - 16);
-  ctx.stroke();
-  ctx.beginPath();
-  ctx.moveTo(c + 15, c - 18);
-  ctx.lineTo(c + 10, c - 12);
-  ctx.lineTo(c + 19, c - 12);
-  ctx.closePath();
-  ctx.fillStyle = C.outline;
-  ctx.fill();
-
-  return { key: "sellIcon", canvas };
-}
-
-/** Porter figure for the hire button. Drawn small on purpose, like the tower icon. */
-function makePorterIcon(): GeneratedTexture {
-  const size = 36;
-  const [canvas, ctx] = makeCanvas(size, size);
-  const c = size / 2;
-
-  outlined(ctx, () => ctx.roundRect(c - 6, c + 2, 4.5, 10, 2), C.woodDark, INK_UNIT * 0.8);
-  outlined(ctx, () => ctx.roundRect(c + 1.5, c + 2, 4.5, 10, 2), C.woodDark, INK_UNIT * 0.8);
-  outlined(ctx, () => ctx.ellipse(c, c + 1, 8.5, 8, 0, 0, TAU), C.canvasBlue, INK_UNIT);
-  outlined(ctx, () => ctx.ellipse(c, c - 8, 7, 6.5, 0, 0, TAU), "#E8C49A", INK_UNIT);
-
-  for (const dx of [-2.4, 2.4]) {
-    ctx.beginPath();
-    ctx.arc(c + dx, c - 8.5, 1.5, 0, TAU);
-    ctx.fillStyle = C.outline;
-    ctx.fill();
-  }
-
-  return { key: "porter", canvas };
-}
-
 export function generateAllTextures(): GeneratedTexture[] {
-  return [
-    makeArrow(),
-    makeSpark(),
-    makePuff(),
-    makeTowerIcon(),
-    makeSellIcon(),
-    makePorterIcon(),
-  ];
+  return [makeArrow(), makeSpark(), makePuff()];
 }

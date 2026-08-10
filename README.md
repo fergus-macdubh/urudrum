@@ -1,4 +1,4 @@
-# Bastion
+# Urudrum: The Orcish Stronghold
 
 A tower-defense prototype for phones, in the spirit of Kingdom Rush. Android first via
 Capacitor, with iOS reachable from the same codebase.

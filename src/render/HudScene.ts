@@ -5,6 +5,25 @@ import type { GameScene } from "./GameScene";
 
 const SERIF = "Georgia, 'Times New Roman', serif";
 
+const END_BUTTON_ART = {
+  replay: "menu-button-play-again",
+  menu: "menu-button-main-menu",
+} as const;
+
+const END_PANEL_ART = {
+  victory: "end-panel-victory",
+  defeat: "end-panel-defeat",
+} as const;
+
+const PAUSE_PANEL_ART = "pause-panel";
+
+const UI_CLICK = { key: "sfx-ui-click", url: "audio/ui-click.mp3" } as const;
+
+const END_SOUNDS = {
+  victory: { key: "sfx-victory", url: "audio/victory.mp3" },
+  defeat: { key: "sfx-defeat", url: "audio/defeat.mp3" },
+} as const;
+
 /**
  * Overlay scene: resource counters and the end-of-run panel. Kept separate from GameScene
  * so camera shake and flashes on the board never move the UI.
@@ -18,6 +37,7 @@ export class HudScene extends Phaser.Scene {
   private porterText!: Phaser.GameObjects.Text;
 
   private overlay?: Phaser.GameObjects.Container;
+  private pauseOverlay?: Phaser.GameObjects.Container;
   private lastStatus: string = "playing";
   private lastLives = -1;
 
@@ -25,17 +45,71 @@ export class HudScene extends Phaser.Scene {
     super("Hud");
   }
 
+  preload(): void {
+    for (const key of Object.values(END_BUTTON_ART)) {
+      if (!this.textures.exists(key)) this.load.image(key, `sprites/${key}.png`);
+    }
+    for (const key of Object.values(END_PANEL_ART)) {
+      if (!this.textures.exists(key)) this.load.image(key, `sprites/${key}.png`);
+    }
+    if (!this.textures.exists(PAUSE_PANEL_ART)) {
+      this.load.image(PAUSE_PANEL_ART, `sprites/${PAUSE_PANEL_ART}.png`);
+    }
+    if (!this.cache.audio.exists(UI_CLICK.key)) this.load.audio(UI_CLICK.key, UI_CLICK.url);
+    for (const effect of Object.values(END_SOUNDS)) {
+      if (!this.cache.audio.exists(effect.key)) this.load.audio(effect.key, effect.url);
+    }
+  }
+
   create(): void {
     this.game_ = this.scene.get("Game") as GameScene;
 
     this.buildBanner();
 
+    this.input.keyboard?.on("keydown-ESC", (event: KeyboardEvent) => {
+      if (!event.repeat) this.togglePause();
+    });
+
     // A fresh Game scene means a fresh run; drop any stale end-of-run panel.
     this.game_.events.on("start", () => {
       this.overlay?.destroy();
       this.overlay = undefined;
+      this.pauseOverlay?.destroy();
+      this.pauseOverlay = undefined;
       this.lastStatus = "playing";
     });
+  }
+
+  private togglePause(): void {
+    if (!this.game_?.world || this.game_.world.status !== "playing") return;
+
+    if (this.scene.isPaused("Game")) {
+      this.scene.resume("Game");
+      this.pauseOverlay?.destroy();
+      this.pauseOverlay = undefined;
+      return;
+    }
+
+    this.scene.pause("Game");
+    this.showPauseOverlay();
+  }
+
+  private showPauseOverlay(): void {
+    if (this.pauseOverlay) return;
+
+    const cx = VIEW.width / 2;
+    const cy = VIEW.height / 2;
+    const dim = this.add
+      .rectangle(cx, cy, VIEW.width, VIEW.height, 0x000000, 0.58)
+      .setInteractive();
+    const panel = this.add.image(cx, cy, PAUSE_PANEL_ART);
+    panel.setDisplaySize(680, (680 * panel.height) / panel.width);
+
+    this.pauseOverlay = this.add
+      .container(0, 0, [dim, panel])
+      .setDepth(200)
+      .setAlpha(0);
+    this.tweens.add({ targets: this.pauseOverlay, alpha: 1, duration: 140 });
   }
 
   private buildBanner(): void {
@@ -151,57 +225,48 @@ export class HudScene extends Phaser.Scene {
   }
 
   private showEndPanel(won: boolean): void {
+    if (won) this.game_.recordVictory();
+    this.sound.play(won ? END_SOUNDS.victory.key : END_SOUNDS.defeat.key, { volume: 0.62 });
+
     const cx = VIEW.width / 2;
     const cy = VIEW.height / 2;
 
     const dim = this.add.rectangle(cx, cy, VIEW.width, VIEW.height, 0x000000, 0.55);
 
-    const panel = this.add.graphics();
-    panel.fillStyle(hex(C.panel), 0.97);
-    panel.fillRoundedRect(cx - 230, cy - 130, 460, 260, 20);
-    panel.lineStyle(6, won ? hex(C.gold) : hex(C.danger), 1);
-    panel.strokeRoundedRect(cx - 230, cy - 130, 460, 260, 20);
-
-    const title = this.add
-      .text(cx, cy - 64, won ? "Victory!" : "The Keep Has Fallen", {
-        fontFamily: SERIF,
-        fontSize: won ? "54px" : "38px",
-        color: won ? C.gold : C.danger,
-        stroke: C.outline,
-        strokeThickness: 7,
-      })
-      .setOrigin(0.5);
+    const panel = this.add.image(
+      cx,
+      cy,
+      won ? END_PANEL_ART.victory : END_PANEL_ART.defeat,
+    );
+    panel.setDisplaySize(570, (570 * panel.height) / panel.width);
 
     const world = this.game_.world;
     const subtitle = this.add
       .text(
         cx,
-        cy + 4,
+        cy + 22,
         won
           ? `${world.lives} of ${ECONOMY.startLives} lives remaining`
           : "The horde broke through",
-        { fontFamily: SERIF, fontSize: "22px", color: C.parchment },
+        {
+          fontFamily: SERIF,
+          fontSize: "22px",
+          color: C.parchment,
+          stroke: C.outline,
+          strokeThickness: 4,
+        },
       )
       .setOrigin(0.5);
 
-    const button = this.add
-      .rectangle(cx, cy + 78, 220, 62, hex(C.panelLight))
-      .setStrokeStyle(4, hex(C.gold))
+    const replayButton = this.add.image(cx - 122, cy + 102, END_BUTTON_ART.replay);
+    replayButton.setDisplaySize(210, (210 * replayButton.height) / replayButton.width);
+    const replayHit = this.add
+      .zone(cx - 122, cy + 102, replayButton.displayWidth, replayButton.displayHeight)
       .setInteractive({ useHandCursor: true });
-
-    const buttonText = this.add
-      .text(cx, cy + 78, "Play Again", {
-        fontFamily: SERIF,
-        fontSize: "26px",
-        color: C.parchment,
-        stroke: C.outline,
-        strokeThickness: 4,
-      })
-      .setOrigin(0.5);
-
-    button.on("pointerover", () => button.setFillStyle(hex(C.wood)));
-    button.on("pointerout", () => button.setFillStyle(hex(C.panelLight)));
-    button.on("pointerdown", () => {
+    replayHit.on("pointerover", () => replayButton.setTint(0xffefc2));
+    replayHit.on("pointerout", () => replayButton.clearTint());
+    replayHit.on("pointerdown", () => {
+      this.sound.play(UI_CLICK.key, { volume: 0.24 });
       this.overlay?.destroy();
       this.overlay = undefined;
       this.lastStatus = "playing";
@@ -209,8 +274,29 @@ export class HudScene extends Phaser.Scene {
       this.game_.restart();
     });
 
+    const menuButton = this.add.image(cx + 122, cy + 102, END_BUTTON_ART.menu);
+    menuButton.setDisplaySize(210, (210 * menuButton.height) / menuButton.width);
+    const menuHit = this.add
+      .zone(cx + 122, cy + 102, menuButton.displayWidth, menuButton.displayHeight)
+      .setInteractive({ useHandCursor: true });
+    menuHit.on("pointerover", () => menuButton.setTint(0xffefc2));
+    menuHit.on("pointerout", () => menuButton.clearTint());
+    menuHit.on("pointerdown", () => {
+      this.sound.play(UI_CLICK.key, { volume: 0.24 });
+      this.scene.stop("Game");
+      this.scene.start("Menu");
+    });
+
     this.overlay = this.add
-      .container(0, 0, [dim, panel, title, subtitle, button, buttonText])
+      .container(0, 0, [
+        dim,
+        panel,
+        subtitle,
+        replayButton,
+        replayHit,
+        menuButton,
+        menuHit,
+      ])
       .setDepth(100);
 
     this.overlay.setAlpha(0);
