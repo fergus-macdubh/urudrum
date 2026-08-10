@@ -15,8 +15,7 @@ import { C, hex } from "./palette";
  * line. Paths are relative to `public/`.
  */
 const REAL_ART: Record<string, string> = {
-  terrain: "sprites/map.png",
-  keep: "sprites/keep.png",
+  terrain: "sprites/map-gate-preview.png",
   "ui-icon-build": "sprites/ui-icon-build.png",
   "ui-icon-hire": "sprites/ui-icon-hire.png",
   "ui-icon-sell": "sprites/ui-icon-sell.png",
@@ -36,9 +35,6 @@ const SOUND_EFFECTS = {
   ],
   sell: { key: "sfx-sell-tower", url: "audio/sell-tower.mp3" },
 } as const;
-
-/** On-screen height of the keep. Its ramp is what the lane has to meet. */
-const KEEP_DISPLAY_HEIGHT = 150;
 
 const DEPOT_DISPLAY_HEIGHT = 130;
 
@@ -376,12 +372,6 @@ export class GameScene extends Phaser.Scene {
           .setDepth(DEPTH.keep + 0.02),
       );
     }
-
-    // Anchored by its foot so the ramp lands on the lane's end point, with the bulk of the
-    // fortress rising up and to the right of it.
-    const end = this.world.path.points[this.world.path.points.length - 1]!;
-    const keep = this.add.image(end.x + 30, end.y + 42, "keep").setOrigin(0.5, 1);
-    keep.setScale(KEEP_DISPLAY_HEIGHT / keep.height).setDepth(DEPTH.keep);
 
     this.createPads();
     this.createBuildMenu();
