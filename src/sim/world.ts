@@ -1,14 +1,17 @@
 import {
-  BUILD_SLOTS,
-  DEPOT,
+  BOMB_TOWER,
   ECONOMY,
+  ELF_ATTACK,
   ENEMIES,
   FIXED_STEP,
+  getLevelLayout,
   MAX_FRAME_TIME,
-  PATH_POINTS,
   SUPPLY,
-  TOWER,
+  TOWER_UPGRADES,
+  TOWER_STATS,
+  towerStatsFor,
 } from "./config";
+import type { TowerKind } from "./config";
 import { Path } from "./path";
 import type {
   BuildSlot,
@@ -16,10 +19,11 @@ import type {
   GameEvent,
   GameStatus,
   Porter,
+  PorterKind,
   Projectile,
   Tower,
 } from "./types";
-import { buildSpawnSchedule, type ScheduledSpawn } from "./waves";
+import { buildSpawnSchedule, type ScheduledSpawn, wavesForLevel } from "./waves";
 import { dist } from "./vec";
 
 /**
@@ -31,7 +35,14 @@ import { dist } from "./vec";
  */
 export class World {
   readonly path: Path;
+  readonly paths: Path[];
   readonly slots: BuildSlot[];
+  readonly depot: { x: number; y: number };
+  readonly terrainKey: string;
+  readonly bombTowerAvailable: boolean;
+  readonly incendiaryPorterAvailable: boolean;
+  readonly airshipPorterAvailable: boolean;
+  readonly towerUpgradesAvailable: boolean;
 
   enemies: Enemy[] = [];
   towers: Tower[] = [];
@@ -52,26 +63,40 @@ export class World {
   private nextSpawnIndex = 0;
   private accumulator = 0;
   private nextId = 1;
+  private randomState = 0x51f15e;
 
-  constructor() {
-    this.path = new Path(PATH_POINTS);
-    this.slots = BUILD_SLOTS.map(([x, y], index) => ({ index, x, y, towerId: null }));
-    this.schedule = buildSpawnSchedule();
+  constructor(level = 1) {
+    const layout = getLevelLayout(level);
+    this.paths = layout.paths.map((points) => new Path(points));
+    this.path = this.paths[0]!;
+    this.depot = layout.depot;
+    this.terrainKey = layout.terrainKey;
+    this.bombTowerAvailable = layout.bombTowerAvailable;
+    this.incendiaryPorterAvailable = layout.incendiaryPorterAvailable;
+    this.airshipPorterAvailable = layout.airshipPorterAvailable;
+    this.towerUpgradesAvailable = layout.towerUpgradesAvailable;
+    this.gold = layout.startGold;
+    this.slots = layout.buildSlots.map(([x, y], index) => ({ index, x, y, towerId: null }));
+    this.schedule = buildSpawnSchedule(wavesForLevel(level));
 
-    for (let i = 0; i < SUPPLY.startingPorters; i++) {
+    for (let i = 0; i < layout.startingPorters; i++) {
       this.spawnPorter();
     }
   }
 
-  private spawnPorter(): Porter {
+  private spawnPorter(kind: PorterKind = "normal"): Porter {
     const porter: Porter = {
       id: this.nextId++,
-      x: DEPOT.x,
-      y: DEPOT.y,
+      kind,
+      x: this.depot.x,
+      y: this.depot.y,
       angle: 0,
       carrying: 0,
       targetTowerId: null,
       loading: 0,
+      fleeing: false,
+      altitude: kind === "airship" ? 0 : 0,
+      airshipService: "none",
     };
     this.porters.push(porter);
     return porter;
@@ -100,8 +125,43 @@ export class World {
     return this.gold >= cost;
   }
 
-  get sellValue(): number {
-    return Math.floor(TOWER.cost * TOWER.sellRefund);
+  sellValueFor(slotIndex: number): number {
+    const slot = this.slots[slotIndex];
+    if (!slot || slot.towerId === null) return 0;
+    const tower = this.towers.find((t) => t.id === slot.towerId);
+    if (!tower) return 0;
+    const stats = TOWER_STATS[tower.kind];
+    const invested = stats.cost + (tower.level === 2 ? TOWER_UPGRADES[tower.kind].upgradeCost : 0);
+    return Math.floor(invested * stats.sellRefund);
+  }
+
+  upgradeCostFor(slotIndex: number): number {
+    const slot = this.slots[slotIndex];
+    if (!slot || slot.towerId === null) return 0;
+    const tower = this.towers.find((candidate) => candidate.id === slot.towerId);
+    if (!tower || tower.level === 2) return 0;
+    return TOWER_UPGRADES[tower.kind].upgradeCost;
+  }
+
+  /** Improves an existing tower in place while preserving both magazines. */
+  tryUpgrade(slotIndex: number): boolean {
+    if (!this.towerUpgradesAvailable) return false;
+    const slot = this.slots[slotIndex];
+    if (!slot || slot.towerId === null) return false;
+    const tower = this.towers.find((candidate) => candidate.id === slot.towerId);
+    if (!tower || tower.level === 2) return false;
+
+    const stats = TOWER_UPGRADES[tower.kind];
+    if (this.gold < stats.upgradeCost) return false;
+    this.gold -= stats.upgradeCost;
+    tower.level = 2;
+    tower.range = stats.range;
+    tower.damage = stats.damage;
+    tower.fireInterval = 1 / stats.fireRate;
+    tower.splashRadius = stats.splashRadius;
+    tower.cooldown = Math.min(tower.cooldown, tower.fireInterval);
+    this.events.push({ type: "upgrade", towerId: tower.id, towerKind: tower.kind, x: tower.x, y: tower.y });
+    return true;
   }
 
   /** Dismantles a tower for a partial refund. Returns true if one was actually sold. */
@@ -110,13 +170,14 @@ export class World {
     if (!slot || slot.towerId === null) return false;
 
     const towerId = slot.towerId;
+    const refund = this.sellValueFor(slotIndex);
     this.towers = this.towers.filter((t) => t.id !== towerId);
     slot.towerId = null;
-    this.gold += this.sellValue;
+    this.gold += refund;
 
     // Any porter already walking a crate out to it turns back with the load still in hand;
     // `updatePorters` sees the missing tower and re-tasks it.
-    this.events.push({ type: "sell", x: slot.x, y: slot.y, refund: this.sellValue });
+    this.events.push({ type: "sell", x: slot.x, y: slot.y, refund });
     return true;
   }
 
@@ -131,31 +192,60 @@ export class World {
 
     this.gold -= SUPPLY.porterCost;
     const porter = this.spawnPorter();
-    this.events.push({ type: "hire", porterId: porter.id, x: porter.x, y: porter.y });
+    this.events.push({ type: "hire", porterId: porter.id, porterKind: porter.kind, x: porter.x, y: porter.y });
+    return true;
+  }
+
+  /** Hires the premium porter that feeds a separate incendiary magazine. */
+  tryHireIncendiaryPorter(): boolean {
+    if (!this.incendiaryPorterAvailable || !this.canHirePorter) return false;
+    if (this.gold < SUPPLY.incendiaryPorterCost) return false;
+
+    this.gold -= SUPPLY.incendiaryPorterCost;
+    const porter = this.spawnPorter("incendiary");
+    this.events.push({ type: "hire", porterId: porter.id, porterKind: porter.kind, x: porter.x, y: porter.y });
+    return true;
+  }
+
+  /** Hires a premium flying porter that elves cannot intercept. */
+  tryHireAirshipPorter(): boolean {
+    if (!this.airshipPorterAvailable || !this.canHirePorter) return false;
+    if (this.gold < SUPPLY.airshipPorterCost) return false;
+
+    this.gold -= SUPPLY.airshipPorterCost;
+    const porter = this.spawnPorter("airship");
+    this.events.push({ type: "hire", porterId: porter.id, porterKind: porter.kind, x: porter.x, y: porter.y });
     return true;
   }
 
   /** Returns true if the tower was actually placed. */
-  tryBuild(slotIndex: number): boolean {
+  tryBuild(slotIndex: number, kind: TowerKind = "archer"): boolean {
     const slot = this.slots[slotIndex];
     if (!slot || slot.towerId !== null) return false;
-    if (this.gold < TOWER.cost) return false;
+    if (kind === "bomb" && !this.bombTowerAvailable) return false;
+    const stats = TOWER_STATS[kind];
+    if (this.gold < stats.cost) return false;
 
-    this.gold -= TOWER.cost;
+    this.gold -= stats.cost;
     const tower: Tower = {
       id: this.nextId++,
+      kind,
+      level: 1,
       slotIndex,
       x: slot.x,
       y: slot.y,
-      range: TOWER.range,
-      damage: TOWER.damage,
+      range: stats.range,
+      damage: stats.damage,
       cooldown: 0,
-      fireInterval: 1 / TOWER.fireRate,
+      fireInterval: 1 / stats.fireRate,
       facing: 0,
       targetId: null,
       // Handed a crate on completion so a new tower is useful before the first porter walks
       // out to it. Building next to nothing would otherwise be a dead 10 seconds.
       ammo: SUPPLY.crateSize,
+      incendiaryAmmo: 0,
+      incendiaryMagazineActive: false,
+      splashRadius: kind === "bomb" ? BOMB_TOWER.splashRadius : 0,
     };
     this.towers.push(tower);
     slot.towerId = tower.id;
@@ -189,10 +279,13 @@ export class World {
       }
 
       const stats = ENEMIES[entry.kind];
-      const start = this.path.sample(0);
+      const pathIndex = entry.route ?? (this.nextSpawnIndex - 1) % this.paths.length;
+      const path = this.paths[pathIndex] ?? this.path;
+      const start = path.sample(0);
       const enemy: Enemy = {
         id: this.nextId++,
         kind: entry.kind,
+        pathIndex,
         travelled: 0,
         speed: stats.speed,
         hp: stats.hp,
@@ -203,6 +296,9 @@ export class World {
         radius: stats.radius,
         incoming: 0,
         alive: true,
+        porterTargetId: null,
+        attackCooldown: 0,
+        attackTimer: 0,
       };
       this.enemies.push(enemy);
       this.events.push({ type: "spawn", enemyId: enemy.id });
@@ -213,9 +309,15 @@ export class World {
     for (const enemy of this.enemies) {
       if (!enemy.alive) continue;
 
+      enemy.attackCooldown = Math.max(0, enemy.attackCooldown - dt);
+      enemy.attackTimer = Math.max(0, enemy.attackTimer - dt);
+
+      if (enemy.kind === "elf" && this.updateElfAttack(enemy, dt)) continue;
+
       enemy.travelled += enemy.speed * dt;
 
-      if (enemy.travelled >= this.path.length) {
+      const path = this.paths[enemy.pathIndex] ?? this.path;
+      if (enemy.travelled >= path.length) {
         enemy.alive = false;
         const damage = ENEMIES[enemy.kind].leakDamage;
         this.lives = Math.max(0, this.lives - damage);
@@ -223,13 +325,50 @@ export class World {
         continue;
       }
 
-      const sample = this.path.sample(enemy.travelled);
+      const sample = path.sample(enemy.travelled);
       enemy.x = sample.x;
       enemy.y = sample.y;
       enemy.angle = sample.angle;
     }
 
     this.enemies = this.enemies.filter((e) => e.alive);
+  }
+
+  /** Elves stay on the lane and loose an arrow when a ground porter enters bow range. */
+  private updateElfAttack(enemy: Enemy, _dt: number): boolean {
+    // Elves never leave the lane. Range is deliberately a little shorter than an archer
+    // tower, so placement and route timing still give ground porters occasional safe trips.
+    if (enemy.attackTimer > 0) return true;
+    if (enemy.attackCooldown > 0) return false;
+
+    let target: Porter | undefined;
+    let nearest: number = ELF_ATTACK.strikeRange;
+    for (const porter of this.porters) {
+      if (porter.kind === "airship" || porter.fleeing || porter.carrying <= 0) continue;
+      const distance = dist(enemy.x, enemy.y, porter.x, porter.y);
+      if (distance < nearest) {
+        nearest = distance;
+        target = porter;
+      }
+    }
+    if (!target) return false;
+
+    enemy.angle = Math.atan2(target.y - enemy.y, target.x - enemy.x);
+    enemy.attackCooldown = ELF_ATTACK.cooldown;
+    enemy.attackTimer = ELF_ATTACK.animationTime;
+    target.carrying = 0;
+    target.targetTowerId = null;
+    target.loading = 0;
+    target.fleeing = true;
+    this.events.push({
+      type: "elfFire",
+      x: enemy.x,
+      y: enemy.y - 28,
+      targetX: target.x,
+      targetY: target.y - 18,
+    });
+    this.events.push({ type: "porterAttacked", porterId: target.id, x: target.x, y: target.y });
+    return true;
   }
 
   private updateTowers(dt: number): void {
@@ -245,28 +384,46 @@ export class World {
       tower.facing = Math.atan2(target.y - tower.y, target.x - tower.x);
 
       if (tower.cooldown > 0) continue;
-      if (tower.ammo < SUPPLY.ammoPerShot) continue;
+      const ammoCost =
+        tower.kind === "bomb" && tower.level === 2
+          ? SUPPLY.bombAmmoPerShot
+          : SUPPLY.ammoPerShot;
+      if (tower.ammo < ammoCost && tower.incendiaryAmmo < ammoCost) continue;
 
-      tower.ammo -= SUPPLY.ammoPerShot;
-      if (tower.ammo < SUPPLY.ammoPerShot) {
+      const incendiary = tower.incendiaryAmmo >= ammoCost;
+      if (incendiary) tower.incendiaryAmmo -= ammoCost;
+      else tower.ammo -= ammoCost;
+      if (tower.ammo < ammoCost && tower.incendiaryAmmo < ammoCost) {
         this.events.push({ type: "dry", towerId: tower.id, x: tower.x, y: tower.y });
       }
       tower.cooldown = tower.fireInterval;
-      target.incoming += tower.damage;
-      // Arrows leave the bow, not the foot of the tower.
-      const muzzleY = tower.y - TOWER.muzzleHeight;
+      const damage = incendiary
+        ? Math.round(tower.damage * SUPPLY.incendiaryDamageMultiplier)
+        : tower.damage;
+      target.incoming += damage;
+      const stats = towerStatsFor(tower.kind, tower.level);
+      const muzzleY = tower.y - stats.muzzleHeight;
       this.projectiles.push({
         id: this.nextId++,
+        kind: tower.kind,
         x: tower.x,
         y: muzzleY,
-        speed: TOWER.projectileSpeed,
-        damage: tower.damage,
+        speed: stats.projectileSpeed,
+        damage,
         targetId: target.id,
+        targetX: target.x,
+        targetY: target.y,
+        splashRadius: tower.splashRadius,
+        incendiary,
+        flight: 0,
+        flightDistance: dist(tower.x, muzzleY, target.x, target.y),
         angle: tower.facing,
       });
       this.events.push({
         type: "fire",
         towerId: tower.id,
+        towerKind: tower.kind,
+        incendiary,
         x: tower.x,
         y: muzzleY,
         angle: tower.facing,
@@ -291,7 +448,11 @@ export class World {
       const dy = enemy.y - tower.y;
       if (dx * dx + dy * dy > rangeSq) continue;
 
-      if (best === null || enemy.travelled > best.travelled) {
+      const progress = enemy.travelled / (this.paths[enemy.pathIndex]?.length ?? this.path.length);
+      const bestProgress = best
+        ? best.travelled / (this.paths[best.pathIndex]?.length ?? this.path.length)
+        : -1;
+      if (best === null || progress > bestProgress) {
         best = enemy;
       }
     }
@@ -308,6 +469,19 @@ export class World {
    */
   private updatePorters(dt: number): void {
     for (const porter of this.porters) {
+      if (porter.kind === "airship") {
+        this.updateAirshipPorter(porter, dt);
+        continue;
+      }
+
+      if (porter.fleeing) {
+        if (this.stepToward(porter, this.depot.x, this.depot.y, dt)) {
+          porter.fleeing = false;
+          porter.loading = SUPPLY.loadTime;
+        }
+        continue;
+      }
+
       if (porter.carrying > 0) {
         const tower = this.towers.find((t) => t.id === porter.targetTowerId);
         if (!tower) {
@@ -317,29 +491,118 @@ export class World {
           continue;
         }
         if (this.stepToward(porter, tower.x, tower.y, dt)) {
-          const delivered = Math.min(porter.carrying, SUPPLY.towerAmmoMax - tower.ammo);
-          tower.ammo += delivered;
+          const delivered =
+            porter.kind === "incendiary"
+              ? Math.min(porter.carrying, SUPPLY.incendiaryAmmoMax - tower.incendiaryAmmo)
+              : Math.min(porter.carrying, SUPPLY.towerAmmoMax - tower.ammo);
+          if (porter.kind === "incendiary") {
+            tower.incendiaryAmmo += delivered;
+            tower.incendiaryMagazineActive = true;
+          } else tower.ammo += delivered;
           porter.carrying = 0;
           porter.targetTowerId = null;
-          this.events.push({ type: "deliver", x: tower.x, y: tower.y, amount: delivered });
+          this.events.push({ type: "deliver", porterKind: porter.kind, x: tower.x, y: tower.y, amount: delivered });
         }
         continue;
       }
 
-      if (!this.stepToward(porter, DEPOT.x, DEPOT.y, dt)) continue;
+      if (!this.stepToward(porter, this.depot.x, this.depot.y, dt)) continue;
 
       if (porter.loading > 0) {
         porter.loading -= dt;
         continue;
       }
 
-      const target = this.pickResupplyTarget();
+      const target =
+        porter.kind === "incendiary"
+          ? this.pickIncendiaryResupplyTarget()
+          : this.pickResupplyTarget();
       if (!target) continue; // Nothing needs crates; wait at the depot.
 
-      porter.carrying = SUPPLY.crateSize;
+      porter.carrying =
+        porter.kind === "incendiary" ? SUPPLY.incendiaryCrateSize : SUPPLY.crateSize;
       porter.targetTowerId = target.id;
       porter.loading = SUPPLY.loadTime;
     }
+  }
+
+  /** Flying supply is safe but slower: every stop includes a visible descent and climb. */
+  private updateAirshipPorter(porter: Porter, dt: number): void {
+    const verticalStep = dt / SUPPLY.airshipVerticalTime;
+    if (porter.airshipService === "loweringDepot") {
+      porter.altitude = Math.max(0, porter.altitude - verticalStep);
+      if (porter.altitude === 0) {
+        porter.airshipService = "none";
+        porter.loading = SUPPLY.loadTime;
+      }
+      return;
+    }
+    if (porter.airshipService === "raisingDepot") {
+      porter.altitude = Math.min(1, porter.altitude + verticalStep);
+      if (porter.altitude === 1) porter.airshipService = "none";
+      return;
+    }
+    if (porter.airshipService === "loweringTower") {
+      porter.altitude = Math.max(0, porter.altitude - verticalStep);
+      if (porter.altitude === 0) {
+        const tower = this.towers.find((candidate) => candidate.id === porter.targetTowerId);
+        if (tower) this.deliverPorterLoad(porter, tower);
+        else {
+          porter.carrying = 0;
+          porter.targetTowerId = null;
+        }
+        porter.airshipService = "raisingTower";
+      }
+      return;
+    }
+    if (porter.airshipService === "raisingTower") {
+      porter.altitude = Math.min(1, porter.altitude + verticalStep);
+      if (porter.altitude === 1) porter.airshipService = "none";
+      return;
+    }
+
+    if (porter.carrying > 0) {
+      const tower = this.towers.find((candidate) => candidate.id === porter.targetTowerId);
+      if (!tower) {
+        porter.carrying = 0;
+        porter.targetTowerId = null;
+        return;
+      }
+      if (this.stepToward(porter, tower.x, tower.y, dt)) {
+        porter.airshipService = "loweringTower";
+      }
+      return;
+    }
+
+    if (!this.stepToward(porter, this.depot.x, this.depot.y, dt)) return;
+    if (porter.altitude > 0) {
+      porter.airshipService = "loweringDepot";
+      return;
+    }
+    if (porter.loading > 0) {
+      porter.loading = Math.max(0, porter.loading - dt);
+      return;
+    }
+
+    const target = this.pickResupplyTarget();
+    if (!target) return;
+    porter.carrying = SUPPLY.crateSize;
+    porter.targetTowerId = target.id;
+    porter.airshipService = "raisingDepot";
+  }
+
+  private deliverPorterLoad(porter: Porter, tower: Tower): void {
+    const delivered =
+      porter.kind === "incendiary"
+        ? Math.min(porter.carrying, SUPPLY.incendiaryAmmoMax - tower.incendiaryAmmo)
+        : Math.min(porter.carrying, SUPPLY.towerAmmoMax - tower.ammo);
+    if (porter.kind === "incendiary") {
+      tower.incendiaryAmmo += delivered;
+      tower.incendiaryMagazineActive = true;
+    } else tower.ammo += delivered;
+    porter.carrying = 0;
+    porter.targetTowerId = null;
+    this.events.push({ type: "deliver", porterKind: porter.kind, x: tower.x, y: tower.y, amount: delivered });
   }
 
   /** Moves a porter toward a point; returns true once it has arrived. */
@@ -347,7 +610,8 @@ export class World {
     const dx = x - porter.x;
     const dy = y - porter.y;
     const distance = Math.hypot(dx, dy);
-    const travel = SUPPLY.porterSpeed * dt;
+    const baseSpeed = porter.kind === "airship" ? SUPPLY.airshipSpeed : SUPPLY.porterSpeed;
+    const travel = baseSpeed * (porter.fleeing ? SUPPLY.fleeSpeedMultiplier : 1) * dt;
 
     if (distance <= travel) {
       porter.x = x;
@@ -379,7 +643,7 @@ export class World {
 
         const score =
           tower.ammo / SUPPLY.towerAmmoMax +
-          dist(DEPOT.x, DEPOT.y, tower.x, tower.y) / 4000;
+          dist(this.depot.x, this.depot.y, tower.x, tower.y) / 4000;
         if (score < bestScore) {
           bestScore = score;
           best = tower;
@@ -391,36 +655,82 @@ export class World {
     return null;
   }
 
+  /** A seeded random choice keeps the special porter unpredictable but deterministic. */
+  private pickIncendiaryResupplyTarget(): Tower | null {
+    const claimed = new Set(
+      this.porters
+        .filter((porter) => porter.kind === "incendiary")
+        .map((porter) => porter.targetTowerId)
+        .filter((id): id is number => id !== null),
+    );
+    let candidates = this.towers.filter(
+      (tower) => tower.incendiaryAmmo < SUPPLY.incendiaryAmmoMax && !claimed.has(tower.id),
+    );
+    if (candidates.length === 0) {
+      candidates = this.towers.filter(
+        (tower) => tower.incendiaryAmmo < SUPPLY.incendiaryAmmoMax,
+      );
+    }
+    if (candidates.length === 0) return null;
+    return candidates[Math.floor(this.nextRandom() * candidates.length)] ?? null;
+  }
+
+  private nextRandom(): number {
+    this.randomState = (Math.imul(this.randomState, 1664525) + 1013904223) >>> 0;
+    return this.randomState / 0x1_0000_0000;
+  }
+
   private moveProjectiles(dt: number): void {
     const survivors: Projectile[] = [];
 
     for (const projectile of this.projectiles) {
       const target = this.enemies.find((e) => e.id === projectile.targetId && e.alive);
-      if (!target) continue; // Target already died; the arrow is spent.
+      if (target) {
+        projectile.targetX = target.x;
+        projectile.targetY = target.y;
+      } else if (projectile.kind === "archer") {
+        continue; // Target already died; the arrow is spent.
+      }
 
-      const dx = target.x - projectile.x;
-      const dy = target.y - projectile.y;
+      const dx = projectile.targetX - projectile.x;
+      const dy = projectile.targetY - projectile.y;
       const distance = Math.hypot(dx, dy);
       const travel = projectile.speed * dt;
       projectile.angle = Math.atan2(dy, dx);
 
-      if (distance <= travel + target.radius) {
-        this.applyDamage(target, projectile.damage);
+      if (distance <= travel + (target?.radius ?? 8)) {
+        if (projectile.kind === "bomb") {
+          this.events.push({
+            type: "explode",
+            x: projectile.targetX,
+            y: projectile.targetY,
+            radius: projectile.splashRadius,
+          });
+          for (const enemy of [...this.enemies]) {
+            if (!enemy.alive) continue;
+            if (dist(enemy.x, enemy.y, projectile.targetX, projectile.targetY) <= projectile.splashRadius) {
+              this.applyDamage(enemy, projectile.damage, "bomb", projectile.incendiary);
+            }
+          }
+        } else if (target) {
+          this.applyDamage(target, projectile.damage, "archer", projectile.incendiary);
+        }
         continue;
       }
 
       projectile.x += (dx / distance) * travel;
       projectile.y += (dy / distance) * travel;
+      projectile.flight += travel;
       survivors.push(projectile);
     }
 
     this.projectiles = survivors;
   }
 
-  private applyDamage(enemy: Enemy, damage: number): void {
+  private applyDamage(enemy: Enemy, damage: number, towerKind: TowerKind, incendiary: boolean): void {
     enemy.incoming = Math.max(0, enemy.incoming - damage);
     enemy.hp -= damage;
-    this.events.push({ type: "hit", x: enemy.x, y: enemy.y, damage });
+    this.events.push({ type: "hit", towerKind, incendiary, x: enemy.x, y: enemy.y, damage });
 
     if (enemy.hp <= 0) {
       enemy.alive = false;

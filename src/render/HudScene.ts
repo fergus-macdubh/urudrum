@@ -7,6 +7,7 @@ const SERIF = "Georgia, 'Times New Roman', serif";
 
 const END_BUTTON_ART = {
   replay: "menu-button-play-again",
+  next: "menu-button-next-level",
   menu: "menu-button-main-menu",
 } as const;
 
@@ -247,7 +248,7 @@ export class HudScene extends Phaser.Scene {
         cy + 22,
         won
           ? `${world.lives} of ${ECONOMY.startLives} lives remaining`
-          : "The horde broke through",
+          : "The royal forces broke through",
         {
           fontFamily: SERIF,
           fontSize: "22px",
@@ -258,15 +259,25 @@ export class HudScene extends Phaser.Scene {
       )
       .setOrigin(0.5);
 
-    const replayButton = this.add.image(cx - 122, cy + 102, END_BUTTON_ART.replay);
-    replayButton.setDisplaySize(210, (210 * replayButton.height) / replayButton.width);
-    const replayHit = this.add
-      .zone(cx - 122, cy + 102, replayButton.displayWidth, replayButton.displayHeight)
-      .setInteractive({ useHandCursor: true });
-    replayHit.on("pointerover", () => replayButton.setTint(0xffefc2));
-    replayHit.on("pointerout", () => replayButton.clearTint());
-    replayHit.on("pointerdown", () => {
-      this.sound.play(UI_CLICK.key, { volume: 0.24 });
+    const canContinue = won && this.game_.hasNextLevel;
+    const buttonWidth = canContinue ? 180 : 210;
+    const buttonY = cy + 102;
+    const makeButton = (x: number, texture: string, onPress: () => void) => {
+      const image = this.add.image(x, buttonY, texture);
+      image.setDisplaySize(buttonWidth, (buttonWidth * image.height) / image.width);
+      const hit = this.add
+        .zone(x, buttonY, image.displayWidth, image.displayHeight)
+        .setInteractive({ useHandCursor: true });
+      hit.on("pointerover", () => image.setTint(0xffefc2));
+      hit.on("pointerout", () => image.clearTint());
+      hit.on("pointerdown", () => {
+        this.sound.play(UI_CLICK.key, { volume: 0.24 });
+        onPress();
+      });
+      return [image, hit] as const;
+    };
+
+    const replay = makeButton(canContinue ? cx - 196 : cx - 122, END_BUTTON_ART.replay, () => {
       this.overlay?.destroy();
       this.overlay = undefined;
       this.lastStatus = "playing";
@@ -274,15 +285,17 @@ export class HudScene extends Phaser.Scene {
       this.game_.restart();
     });
 
-    const menuButton = this.add.image(cx + 122, cy + 102, END_BUTTON_ART.menu);
-    menuButton.setDisplaySize(210, (210 * menuButton.height) / menuButton.width);
-    const menuHit = this.add
-      .zone(cx + 122, cy + 102, menuButton.displayWidth, menuButton.displayHeight)
-      .setInteractive({ useHandCursor: true });
-    menuHit.on("pointerover", () => menuButton.setTint(0xffefc2));
-    menuHit.on("pointerout", () => menuButton.clearTint());
-    menuHit.on("pointerdown", () => {
-      this.sound.play(UI_CLICK.key, { volume: 0.24 });
+    const next = canContinue
+      ? makeButton(cx, END_BUTTON_ART.next, () => {
+          this.overlay?.destroy();
+          this.overlay = undefined;
+          this.lastStatus = "playing";
+          this.lastLives = -1;
+          this.game_.startNextLevel();
+        })
+      : [];
+
+    const menu = makeButton(canContinue ? cx + 196 : cx + 122, END_BUTTON_ART.menu, () => {
       this.scene.stop("Game");
       this.scene.start("Menu");
     });
@@ -292,10 +305,9 @@ export class HudScene extends Phaser.Scene {
         dim,
         panel,
         subtitle,
-        replayButton,
-        replayHit,
-        menuButton,
-        menuHit,
+        ...replay,
+        ...next,
+        ...menu,
       ])
       .setDepth(100);
 

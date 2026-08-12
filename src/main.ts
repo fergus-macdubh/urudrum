@@ -28,4 +28,13 @@ const game = new Phaser.Game({
 // Console harness for driving and inspecting the game. Dropped from production builds.
 if (import.meta.env.DEV) {
   void import("./dev/harness").then((m) => m.installDevHarness(game));
+
+  // Direct level links keep visual iteration fast without weakening the save progression
+  // in production: http://localhost:5173/?level=4 opens the requested board immediately.
+  const requestedLevel = Number(new URLSearchParams(location.search).get("level"));
+  if (Number.isInteger(requestedLevel) && requestedLevel >= 1) {
+    game.events.once(Phaser.Core.Events.READY, () => {
+      game.scene.start("Game", { saveSlot: 0, level: requestedLevel });
+    });
+  }
 }

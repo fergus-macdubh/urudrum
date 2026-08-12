@@ -1,5 +1,5 @@
 export const SAVE_SLOT_COUNT = 3;
-export const LEVEL_COUNT = 1;
+export const LEVEL_COUNT = 5;
 
 const SAVE_KEY = "urudrum-save-slots";
 const LEGACY_SAVE_KEY = "bastion-save-slots";
@@ -30,18 +30,35 @@ export function loadSaveSlots(): Array<SaveSlot | null> {
       const candidate = parsed[index] as Partial<SaveSlot> | null | undefined;
       if (!candidate || candidate.version !== 1) return null;
 
+      const completedLevels = Array.isArray(candidate.completedLevels)
+        ? candidate.completedLevels.filter(
+            (level): level is number =>
+              Number.isInteger(level) && level >= 1 && level <= LEVEL_COUNT,
+          )
+        : [];
+      // Saves made while the prototype only had one level could never store an
+      // unlockedLevel greater than 1. Derive the unlock from completion as well so those
+      // players immediately see Level 2 without having to replay Level 1.
+      const unlockedFromProgress = completedLevels.includes(4)
+        ? 5
+        : completedLevels.includes(3)
+        ? 4
+        : completedLevels.includes(2)
+        ? 3
+        : completedLevels.includes(1)
+          ? 2
+          : 1;
+
       return {
         version: 1,
         createdAt: Number(candidate.createdAt) || Date.now(),
         updatedAt: Number(candidate.updatedAt) || Date.now(),
         lastLevel: Math.min(LEVEL_COUNT, Math.max(1, Number(candidate.lastLevel) || 1)),
-        unlockedLevel: Math.min(LEVEL_COUNT, Math.max(1, Number(candidate.unlockedLevel) || 1)),
-        completedLevels: Array.isArray(candidate.completedLevels)
-          ? candidate.completedLevels.filter(
-              (level): level is number =>
-                Number.isInteger(level) && level >= 1 && level <= LEVEL_COUNT,
-            )
-          : [],
+        unlockedLevel: Math.min(
+          LEVEL_COUNT,
+          Math.max(unlockedFromProgress, Number(candidate.unlockedLevel) || 1),
+        ),
+        completedLevels,
       };
     });
   } catch {

@@ -1,9 +1,9 @@
 import Phaser from "phaser";
-import { DEPOT, SUPPLY, TOWER, VIEW } from "../sim/config";
+import { BOMB_TOWER, ELF_ATTACK, SUPPLY, TOWER, TOWER_UPGRADES, VIEW } from "../sim/config";
 import type { EnemyKind } from "../sim/config";
 import type { GameEvent } from "../sim/types";
 import { World } from "../sim/world";
-import { markLevelCompleted } from "../save";
+import { LEVEL_COUNT, markLevelCompleted, markLevelStarted } from "../save";
 import { generateAllTextures } from "./art";
 import { C, hex } from "./palette";
 
@@ -15,10 +15,21 @@ import { C, hex } from "./palette";
  * line. Paths are relative to `public/`.
  */
 const REAL_ART: Record<string, string> = {
-  terrain: "sprites/map-gate-preview.png",
-  "ui-icon-build": "sprites/ui-icon-build.png",
-  "ui-icon-hire": "sprites/ui-icon-hire.png",
+  "terrain-1": "sprites/map-gate-preview.png",
+  "terrain-2": "sprites/map-level-2.png",
+  "terrain-3": "sprites/map-level-3.png",
+  "terrain-4": "sprites/map-level-4-v8.png",
+  "terrain-5": "sprites/map-level-5.png",
+  "bomb-tower": "sprites/bomb-tower.png",
+  "bomb-tower-2": "sprites/bomb-tower-2.png",
+  bomb: "sprites/bomb.png",
+  "ui-icon-archer": "sprites/ui-icon-archer.png",
+  "ui-icon-bomb": "sprites/ui-icon-bomb.png",
+  "ui-icon-porter": "sprites/ui-icon-porter.png",
+  "ui-icon-fire-porter": "sprites/ui-icon-fire-porter.png",
+  "fire-ammo-crate": "sprites/fire-ammo-crate.png",
   "ui-icon-sell": "sprites/ui-icon-sell.png",
+  "goblin-airship": "sprites/goblin-airship.png",
 };
 
 const SOUND_EFFECTS = {
@@ -65,8 +76,9 @@ const DEPOT_INTERIOR_RADIUS = 24;
  * sideways down the road.
  */
 const WALK_ATLASES: Partial<Record<EnemyKind, string>> = {
-  grunt: "peasant",
-  brute: "brute",
+  peasant: "peasant",
+  grunt: "grunt",
+  elf: "elf",
 };
 
 /**
@@ -77,7 +89,9 @@ const WALK_ATLASES: Partial<Record<EnemyKind, string>> = {
  * be pinned above a loaded porter is gone — it would now be a second crate.
  */
 const PORTER_ATLAS = "goblin";
+const PORTER_FLEE_ATLAS = "goblin-flee";
 const PORTER_DISPLAY_HEIGHT = 56;
+const AIRSHIP_DISPLAY_HEIGHT = 104;
 
 const TOWER_DISPLAY_HEIGHT = 96;
 
@@ -107,6 +121,7 @@ function towerAimFrame(facing: number): number {
 // Sized so a full magazine's worth of notches stays about as wide as the tower itself; at
 // 18 rounds a generous pip turns the gauge into a strip wider than the building.
 const AMMO_PIP = { width: 3, height: 7, gap: 1.2, y: 18 } as const;
+const FIRE_AMMO_PIP = { width: 5, height: 5, gap: 1.5, y: 29 } as const;
 
 /**
  * Towers, enemies and porters share one depth band and sort by how far down the screen they
@@ -140,8 +155,9 @@ function walkView(angle: number): "side" | "face" | "back" {
  * instead. A 2× redraw of any of these then needs no code change at all.
  */
 const ENEMY_DISPLAY_HEIGHT: Record<EnemyKind, number> = {
-  grunt: 52,
-  brute: 72,
+  peasant: 52,
+  grunt: 64,
+  elf: 62,
 };
 
 /**
@@ -211,11 +227,15 @@ interface TowerView {
   body: Phaser.GameObjects.Image;
   /** One rectangle per round the magazine holds; filled ones show what is left. */
   pips: Phaser.GameObjects.Rectangle[];
+  firePips: Phaser.GameObjects.Rectangle[];
+  /** Pulsing crossed-arrow badge shown while both magazines are empty. */
+  dryBadge: Phaser.GameObjects.Container;
 }
 
 interface PorterView {
   container: Phaser.GameObjects.Container;
   body: Phaser.GameObjects.Image;
+  fireCargo: Phaser.GameObjects.Image;
   baseScale: number;
   /** Ground covered so far, so the walk can be driven by distance like the enemies. */
   walked: number;
@@ -244,7 +264,7 @@ export class GameScene extends Phaser.Scene {
   private buildMenu!: Phaser.GameObjects.Container;
   private rangePreview!: Phaser.GameObjects.Arc;
   /** Which purchase the popup is currently offering, if any. */
-  private menuKind: "tower" | "porter" | "sell" | null = null;
+  private menuKind: "tower" | "porter" | "manage" | "sell" | null = null;
   private menuSlotIndex: number | null = null;
   /** Stable open-building frame; never changes while the gate animates. */
   private depotSprite!: Phaser.GameObjects.Image;
@@ -252,9 +272,19 @@ export class GameScene extends Phaser.Scene {
   private depotGateSprite!: Phaser.GameObjects.Image;
   private depotPorterPips: Phaser.GameObjects.Rectangle[] = [];
   private menuCostText!: Phaser.GameObjects.Text;
+  private menuActionText!: Phaser.GameObjects.Text;
   private menuButton!: Phaser.GameObjects.Arc;
   private menuIcon!: Phaser.GameObjects.Image;
   private menuIconBacking!: Phaser.GameObjects.Arc;
+  private bombMenuButton!: Phaser.GameObjects.Arc;
+  private bombMenuIcon!: Phaser.GameObjects.Image;
+  private bombMenuIconBacking!: Phaser.GameObjects.Arc;
+  private bombMenuCostText!: Phaser.GameObjects.Text;
+  private bombMenuActionText!: Phaser.GameObjects.Text;
+  private airshipMenuButton!: Phaser.GameObjects.Arc;
+  private airshipMenuIcon!: Phaser.GameObjects.Image;
+  private airshipMenuIconBacking!: Phaser.GameObjects.Arc;
+  private airshipMenuCostText!: Phaser.GameObjects.Text;
   /** Prevents several towers firing on the same simulation tick from clipping loudly. */
   private lastSoundAt = new Map<string, number>();
   private lastGoblinPhrase = -1;
@@ -275,11 +305,13 @@ export class GameScene extends Phaser.Scene {
       if (!this.textures.exists(key)) this.load.image(key, url);
     }
     const atlasKeys = [
-      ...[...Object.values(WALK_ATLASES), PORTER_ATLAS].flatMap((prefix) =>
+      ...[...Object.values(WALK_ATLASES), PORTER_ATLAS, PORTER_FLEE_ATLAS].flatMap((prefix) =>
         ["side", "face", "back"].map((view) => `${prefix}-${view}`),
       ),
+      "elf-attack",
       // Single-row atlases: six tower aim frames, three depot gate states.
       "tower",
+      "tower-2",
       "depot",
     ];
     for (const key of atlasKeys) {
@@ -322,15 +354,16 @@ export class GameScene extends Phaser.Scene {
     this.lastSoundAt.clear();
     this.lastGoblinPhrase = -1;
 
-    this.world = new World();
+    this.world = new World(this.level);
 
-    this.add.image(0, 0, "terrain").setOrigin(0, 0).setDepth(DEPTH.terrain);
+    this.add.image(0, 0, this.world.terrainKey).setOrigin(0, 0).setDepth(DEPTH.terrain);
 
     // The depot doubles as the hire button — tapping the building you get porters from is
     // more discoverable than a HUD control tucked away in a corner.
-    const depotBottom = DEPOT.y + 30;
+    const depot = this.world.depot;
+    const depotBottom = depot.y + 30;
     this.depotSprite = this.add
-      .image(DEPOT.x, depotBottom, "depot", `walk_${DEPOT_GATE.open}`)
+      .image(depot.x, depotBottom, "depot", `walk_${DEPOT_GATE.open}`)
       .setOrigin(0.5, 1)
       .setDepth(DEPTH.keep);
     this.depotSprite.setScale(DEPOT_DISPLAY_HEIGHT / this.depotSprite.height);
@@ -342,7 +375,7 @@ export class GameScene extends Phaser.Scene {
     // full image made roofs, towers and the crane jump. Keep the open frame as a permanent
     // base and overlay only the small gate area for the shut and ajar states.
     this.depotGateSprite = this.add
-      .image(DEPOT.x, depotBottom, "depot", `walk_${DEPOT_GATE.shut}`)
+      .image(depot.x, depotBottom, "depot", `walk_${DEPOT_GATE.shut}`)
       .setOrigin(0.5, 1)
       .setDepth(DEPTH.keep + 0.01)
       .setScale(DEPOT_DISPLAY_HEIGHT / this.depotSprite.height)
@@ -361,8 +394,8 @@ export class GameScene extends Phaser.Scene {
       this.depotPorterPips.push(
         this.add
           .rectangle(
-            DEPOT.x - porterSpan / 2 + i * (DEPOT_PORTER_PIP.width + DEPOT_PORTER_PIP.gap),
-            DEPOT.y + DEPOT_PORTER_PIP.y,
+            depot.x - porterSpan / 2 + i * (DEPOT_PORTER_PIP.width + DEPOT_PORTER_PIP.gap),
+            depot.y + DEPOT_PORTER_PIP.y,
             DEPOT_PORTER_PIP.width,
             DEPOT_PORTER_PIP.height,
             hex(C.accent),
@@ -390,6 +423,17 @@ export class GameScene extends Phaser.Scene {
 
   restart(): void {
     this.scene.restart({ saveSlot: this.saveSlot, level: this.level });
+  }
+
+  get hasNextLevel(): boolean {
+    return this.level < LEVEL_COUNT;
+  }
+
+  startNextLevel(): void {
+    if (!this.hasNextLevel) return;
+    const nextLevel = this.level + 1;
+    markLevelStarted(this.saveSlot, nextLevel);
+    this.scene.restart({ saveSlot: this.saveSlot, level: nextLevel });
   }
 
   recordVictory(): void {
@@ -445,10 +489,9 @@ export class GameScene extends Phaser.Scene {
       .setStrokeStyle(4, hex(C.gold))
       .setInteractive({ useHandCursor: true });
 
-    // Light disc behind the icon: the turret is dark wood, and on the dark panel alone it
-    // was almost invisible.
+    // Light disc behind the icon keeps the chunky weapon silhouette readable on grass.
     this.menuIconBacking = this.add.circle(0, 0, 25, hex(C.stoneLight), 1);
-    this.menuIcon = this.add.image(0, 0, "ui-icon-build");
+    this.menuIcon = this.add.image(0, 0, "ui-icon-archer");
     this.fitMenuIcon();
 
     // Sits just outside the disc so it never overlaps the icon, with a heavy outline so it
@@ -463,20 +506,138 @@ export class GameScene extends Phaser.Scene {
       })
       .setOrigin(0.5);
 
+    this.menuActionText = this.add
+      .text(0, -44, "", {
+        fontFamily: "'Arial Black', Arial, sans-serif",
+        fontSize: "12px",
+        color: C.parchment,
+        stroke: C.outline,
+        strokeThickness: 4,
+      })
+      .setOrigin(0.5)
+      .setVisible(false);
+
+    this.bombMenuButton = this.add
+      .circle(45, 0, 34, hex(C.panel), 0.96)
+      .setStrokeStyle(4, hex(C.gold))
+      .setInteractive({ useHandCursor: true })
+      .setVisible(false);
+    this.bombMenuIconBacking = this.add
+      .circle(45, 0, 25, hex(C.stoneLight), 1)
+      .setVisible(false);
+    this.bombMenuIcon = this.add.image(45, 0, "ui-icon-bomb").setVisible(false);
+    this.bombMenuIcon.setScale(48 / Math.max(this.bombMenuIcon.width, this.bombMenuIcon.height));
+    this.bombMenuCostText = this.add
+      .text(45, 40, `${BOMB_TOWER.cost}`, {
+        fontFamily: "Georgia, 'Times New Roman', serif",
+        fontSize: "22px",
+        color: C.gold,
+        stroke: C.outline,
+        strokeThickness: 5,
+      })
+      .setOrigin(0.5)
+      .setVisible(false);
+    this.bombMenuActionText = this.add
+      .text(45, -44, "", {
+        fontFamily: "'Arial Black', Arial, sans-serif",
+        fontSize: "12px",
+        color: C.parchment,
+        stroke: C.outline,
+        strokeThickness: 4,
+      })
+      .setOrigin(0.5)
+      .setVisible(false);
+
+    this.airshipMenuButton = this.add
+      .circle(90, 0, 34, hex(C.panel), 0.96)
+      .setStrokeStyle(4, hex(C.gold))
+      .setInteractive({ useHandCursor: true })
+      .setVisible(false);
+    this.airshipMenuIconBacking = this.add.circle(90, 0, 25, hex(C.stoneLight), 1).setVisible(false);
+    this.airshipMenuIcon = this.add.image(90, 0, "goblin-airship").setVisible(false);
+    this.airshipMenuIcon.setScale(50 / Math.max(this.airshipMenuIcon.width, this.airshipMenuIcon.height));
+    this.airshipMenuCostText = this.add
+      .text(90, 40, `${SUPPLY.airshipPorterCost}`, {
+        fontFamily: "Georgia, 'Times New Roman', serif",
+        fontSize: "22px",
+        color: C.gold,
+        stroke: C.outline,
+        strokeThickness: 5,
+      })
+      .setOrigin(0.5)
+      .setVisible(false);
+
     this.buildMenu = this.add
-      .container(0, 0, [this.menuButton, this.menuIconBacking, this.menuIcon, this.menuCostText])
+      .container(0, 0, [
+        this.menuButton,
+        this.menuIconBacking,
+        this.menuIcon,
+        this.menuCostText,
+        this.menuActionText,
+        this.bombMenuButton,
+        this.bombMenuIconBacking,
+        this.bombMenuIcon,
+        this.bombMenuCostText,
+        this.bombMenuActionText,
+        this.airshipMenuButton,
+        this.airshipMenuIconBacking,
+        this.airshipMenuIcon,
+        this.airshipMenuCostText,
+      ])
       .setDepth(DEPTH.ui)
       .setVisible(false);
 
     // Hovering the icon shows what the tower would cover. The circle is also shown outright
     // when the popup opens, since a touch screen never sends a hover.
     this.menuButton.on("pointerover", () => {
-      if (this.menuKind === "tower" || this.menuKind === "sell") {
+      if (this.menuKind === "tower" || this.menuKind === "manage" || this.menuKind === "sell") {
         this.rangePreview.setVisible(true);
       }
     });
     this.menuButton.on("pointerout", () => {
       if (this.menuKind === "porter") this.rangePreview.setVisible(false);
+    });
+
+    this.bombMenuButton.on("pointerover", () => {
+      if (this.menuKind === "tower") {
+        this.rangePreview.setRadius(BOMB_TOWER.range).setVisible(true);
+      } else if (this.menuKind === "manage" && this.menuSlotIndex !== null) {
+        const slot = this.world.slots[this.menuSlotIndex];
+        const tower = this.world.towers.find((candidate) => candidate.id === slot?.towerId);
+        if (tower) this.rangePreview.setRadius(tower.range).setVisible(true);
+      }
+    });
+    this.bombMenuButton.on("pointerout", () => {
+      if (this.menuKind === "tower") this.rangePreview.setRadius(TOWER.range);
+      else if (this.menuKind === "manage" && this.menuSlotIndex !== null) {
+        const slot = this.world.slots[this.menuSlotIndex];
+        const tower = this.world.towers.find((candidate) => candidate.id === slot?.towerId);
+        if (tower) this.rangePreview.setRadius(TOWER_UPGRADES[tower.kind].range);
+      }
+    });
+    this.bombMenuButton.on("pointerdown", () => {
+      if (this.menuKind === null) return;
+      this.playEffect(SOUND_EFFECTS.uiClick.key, 0.24);
+      const bought =
+        this.menuKind === "porter"
+          ? this.world.tryHireIncendiaryPorter()
+          : this.menuKind === "manage" && this.menuSlotIndex !== null
+            ? this.world.trySell(this.menuSlotIndex)
+          : this.menuKind === "tower" && this.menuSlotIndex !== null
+            ? this.world.tryBuild(this.menuSlotIndex, "bomb")
+            : false;
+      if (bought) {
+        this.closeBuildMenu();
+        return;
+      }
+      this.shakeBuildMenu();
+    });
+
+    this.airshipMenuButton.on("pointerdown", () => {
+      if (this.menuKind !== "porter") return;
+      this.playEffect(SOUND_EFFECTS.uiClick.key, 0.24);
+      if (this.world.tryHireAirshipPorter()) this.closeBuildMenu();
+      else this.shakeBuildMenu();
     });
 
     this.menuButton.on("pointerdown", () => {
@@ -488,7 +649,9 @@ export class GameScene extends Phaser.Scene {
           ? this.world.tryHirePorter()
           : this.menuKind === "sell"
             ? this.menuSlotIndex !== null && this.world.trySell(this.menuSlotIndex)
-            : this.menuSlotIndex !== null && this.world.tryBuild(this.menuSlotIndex);
+            : this.menuKind === "manage"
+              ? this.menuSlotIndex !== null && this.world.tryUpgrade(this.menuSlotIndex)
+              : this.menuSlotIndex !== null && this.world.tryBuild(this.menuSlotIndex);
 
       if (bought) {
         this.closeBuildMenu();
@@ -497,18 +660,22 @@ export class GameScene extends Phaser.Scene {
 
       // Can't afford it: shake the button rather than silently doing nothing. Anchor the
       // shake to the popup's home x, not its current one, so repeated taps can't walk it away.
-      const homeX =
-        this.menuKind === "porter" ? DEPOT.x : this.world.slots[this.menuSlotIndex!]!.x;
-      this.tweens.killTweensOf(this.buildMenu);
-      this.buildMenu.setX(homeX);
-      this.tweens.add({
-        targets: this.buildMenu,
-        x: homeX + 6,
-        duration: 55,
-        yoyo: true,
-        repeat: 3,
-        onComplete: () => this.buildMenu.setX(homeX),
-      });
+      this.shakeBuildMenu();
+    });
+  }
+
+  private shakeBuildMenu(): void {
+    const homeX =
+      this.menuKind === "porter" ? this.world.depot.x : this.world.slots[this.menuSlotIndex!]!.x;
+    this.tweens.killTweensOf(this.buildMenu);
+    this.buildMenu.setX(homeX);
+    this.tweens.add({
+      targets: this.buildMenu,
+      x: homeX + 6,
+      duration: 55,
+      yoyo: true,
+      repeat: 3,
+      onComplete: () => this.buildMenu.setX(homeX),
     });
   }
 
@@ -523,11 +690,19 @@ export class GameScene extends Phaser.Scene {
     if (!this.world.canHirePorter) return; // At the cap; nothing to offer.
 
     this.menuKind = "porter";
+    this.setManageLabels(false);
+    this.setBombChoiceVisible(this.world.incendiaryPorterAvailable, this.world.airshipPorterAvailable);
     this.menuSlotIndex = null;
-    this.menuIcon.setTexture("ui-icon-hire");
+    this.menuIcon.setTexture("ui-icon-porter");
     this.fitMenuIcon();
     this.menuCostText.setText(`${SUPPLY.porterCost}`);
-    this.showMenuAt(DEPOT.x, DEPOT.y - 40);
+    this.bombMenuIcon.setTexture("ui-icon-fire-porter");
+    this.bombMenuIcon.setScale(48 / Math.max(this.bombMenuIcon.width, this.bombMenuIcon.height));
+    this.bombMenuCostText.setText(`${SUPPLY.incendiaryPorterCost}`);
+    this.airshipMenuIcon.setTexture("goblin-airship");
+    this.airshipMenuIcon.setScale(50 / Math.max(this.airshipMenuIcon.width, this.airshipMenuIcon.height));
+    this.airshipMenuCostText.setText(`${SUPPLY.airshipPorterCost}`);
+    this.showMenuAt(this.world.depot.x, this.world.depot.y - 40);
     this.rangePreview.setVisible(false);
   }
 
@@ -537,29 +712,87 @@ export class GameScene extends Phaser.Scene {
     if (!slot || slot.towerId === null || this.world.status !== "playing") return;
 
     this.menuKind = "sell";
+    this.setManageLabels(true, false);
+    this.setBombChoiceVisible(false);
     this.menuSlotIndex = slotIndex;
     this.menuIcon.setTexture("ui-icon-sell");
     this.fitMenuIcon();
-    this.menuCostText.setText(`+${this.world.sellValue}`);
+    this.menuCostText.setText(`+${this.world.sellValueFor(slotIndex)}`);
     this.showMenuAt(slot.x, slot.y);
     this.rangePreview.setPosition(slot.x, slot.y).setVisible(true);
+  }
+
+  /** Level 5 adds a two-action popup: improve the tower or dismantle it. */
+  private openManageMenu(slotIndex: number): void {
+    const slot = this.world.slots[slotIndex];
+    const tower = this.world.towers.find((candidate) => candidate.id === slot?.towerId);
+    if (!slot || !tower || tower.level === 2 || !this.world.towerUpgradesAvailable) {
+      this.openSellMenu(slotIndex);
+      return;
+    }
+
+    this.menuKind = "manage";
+    this.setManageLabels(true, true);
+    this.menuSlotIndex = slotIndex;
+    this.menuIcon.setTexture(tower.kind === "archer" ? "tower-2" : "bomb-tower-2", tower.kind === "archer" ? "walk_4" : undefined);
+    this.fitMenuIcon();
+    this.menuCostText.setText(`${this.world.upgradeCostFor(slotIndex)}`);
+    this.bombMenuIcon.setTexture("ui-icon-sell");
+    this.bombMenuIcon.setScale(48 / Math.max(this.bombMenuIcon.width, this.bombMenuIcon.height));
+    this.bombMenuCostText.setText(`+${this.world.sellValueFor(slotIndex)}`);
+    this.setBombChoiceVisible(true);
+    this.showMenuAt(slot.x, slot.y);
+    this.rangePreview
+      .setPosition(slot.x, slot.y)
+      .setRadius(TOWER_UPGRADES[tower.kind].range)
+      .setVisible(true);
   }
 
   private openBuildMenu(slotIndex: number): void {
     const slot = this.world.slots[slotIndex];
     if (this.world.status !== "playing") return;
     // Occupied pads sell rather than doing nothing.
-    if (slot && slot.towerId !== null) return this.openSellMenu(slotIndex);
+    if (slot && slot.towerId !== null) return this.openManageMenu(slotIndex);
     if (!slot) return;
 
     this.menuKind = "tower";
+    this.setManageLabels(false);
     this.menuSlotIndex = slotIndex;
-    this.menuIcon.setTexture("ui-icon-build");
+    this.menuIcon.setTexture("ui-icon-archer");
     this.fitMenuIcon();
     this.menuCostText.setText(`${TOWER.cost}`);
+    this.bombMenuIcon.setTexture("ui-icon-bomb");
+    this.bombMenuIcon.setScale(48 / Math.max(this.bombMenuIcon.width, this.bombMenuIcon.height));
+    this.bombMenuCostText.setText(`${BOMB_TOWER.cost}`);
+    this.setBombChoiceVisible(this.world.bombTowerAvailable);
 
     this.showMenuAt(slot.x, slot.y);
-    this.rangePreview.setPosition(slot.x, slot.y).setVisible(true);
+    this.rangePreview.setPosition(slot.x, slot.y).setRadius(TOWER.range).setVisible(true);
+  }
+
+  private setBombChoiceVisible(visible: boolean, airshipVisible = false): void {
+    const archerX = airshipVisible ? -90 : visible ? -45 : 0;
+    this.menuButton.setX(archerX);
+    this.menuIconBacking.setX(archerX);
+    this.menuIcon.setX(archerX);
+    this.menuCostText.setX(archerX);
+    this.menuActionText.setX(archerX);
+    const secondX = airshipVisible ? 0 : 45;
+    this.bombMenuButton.setX(secondX).setVisible(visible);
+    this.bombMenuIconBacking.setX(secondX).setVisible(visible);
+    this.bombMenuIcon.setX(secondX).setVisible(visible);
+    this.bombMenuCostText.setX(secondX).setVisible(visible);
+    this.bombMenuActionText.setX(secondX).setVisible(visible && this.menuKind === "manage");
+    this.airshipMenuButton.setVisible(airshipVisible);
+    this.airshipMenuIconBacking.setVisible(airshipVisible);
+    this.airshipMenuIcon.setVisible(airshipVisible);
+    this.airshipMenuCostText.setVisible(airshipVisible);
+  }
+
+  private setManageLabels(primaryVisible: boolean, secondaryVisible = false): void {
+    this.menuActionText.setText(primaryVisible && secondaryVisible ? "UPGRADE" : "SELL");
+    this.menuActionText.setVisible(primaryVisible);
+    this.bombMenuActionText.setText("SELL").setVisible(secondaryVisible);
   }
 
   // Affordability is no longer passed in: it is re-evaluated every frame instead.
@@ -594,18 +827,52 @@ export class GameScene extends Phaser.Scene {
     if (this.menuKind === null) return;
 
     // Selling always goes ahead: it pays out rather than charging.
-    const affordable =
-      this.menuKind === "sell" ||
-      this.world.canAfford(this.menuKind === "porter" ? SUPPLY.porterCost : TOWER.cost);
+    const primaryCost =
+      this.menuKind === "porter"
+        ? SUPPLY.porterCost
+        : this.menuKind === "manage" && this.menuSlotIndex !== null
+          ? this.world.upgradeCostFor(this.menuSlotIndex)
+          : TOWER.cost;
+    const affordable = this.menuKind === "sell" || this.world.canAfford(primaryCost);
 
     this.menuButton.setStrokeStyle(4, affordable ? hex(C.gold) : hex(C.stoneDark));
     this.menuIconBacking.setFillStyle(hex(affordable ? C.stoneLight : C.stoneDark));
     this.menuIcon.setAlpha(affordable ? 1 : 0.45);
     this.menuCostText.setColor(affordable ? C.gold : C.hpBad);
+
+    if (this.menuKind === "tower" && this.world.bombTowerAvailable) {
+      const bombAffordable = this.world.canAfford(BOMB_TOWER.cost);
+      this.bombMenuButton.setStrokeStyle(4, bombAffordable ? hex(C.gold) : hex(C.stoneDark));
+      this.bombMenuIconBacking.setFillStyle(hex(bombAffordable ? C.stoneLight : C.stoneDark));
+      this.bombMenuIcon.setAlpha(bombAffordable ? 1 : 0.45);
+      this.bombMenuCostText.setColor(bombAffordable ? C.gold : C.hpBad);
+    }
+    if (this.menuKind === "manage") {
+      this.bombMenuButton.setStrokeStyle(4, hex(C.gold));
+      this.bombMenuIconBacking.setFillStyle(hex(C.stoneLight));
+      this.bombMenuIcon.setAlpha(1);
+      this.bombMenuCostText.setColor(C.gold);
+    }
+    if (this.menuKind === "porter" && this.world.incendiaryPorterAvailable) {
+      const fireAffordable = this.world.canAfford(SUPPLY.incendiaryPorterCost);
+      this.bombMenuButton.setStrokeStyle(4, fireAffordable ? hex(C.gold) : hex(C.stoneDark));
+      this.bombMenuIconBacking.setFillStyle(hex(fireAffordable ? C.stoneLight : C.stoneDark));
+      this.bombMenuIcon.setAlpha(fireAffordable ? 1 : 0.45);
+      this.bombMenuCostText.setColor(fireAffordable ? C.gold : C.hpBad);
+    }
+    if (this.menuKind === "porter" && this.world.airshipPorterAvailable) {
+      const airshipAffordable = this.world.canAfford(SUPPLY.airshipPorterCost);
+      this.airshipMenuButton.setStrokeStyle(4, airshipAffordable ? hex(C.gold) : hex(C.stoneDark));
+      this.airshipMenuIconBacking.setFillStyle(hex(airshipAffordable ? C.stoneLight : C.stoneDark));
+      this.airshipMenuIcon.setAlpha(airshipAffordable ? 1 : 0.45);
+      this.airshipMenuCostText.setColor(airshipAffordable ? C.gold : C.hpBad);
+    }
   }
 
   private closeBuildMenu(): void {
     this.menuKind = null;
+    this.setManageLabels(false);
+    this.setBombChoiceVisible(false);
     this.menuSlotIndex = null;
     this.tweens.killTweensOf(this.buildMenu);
     this.buildMenu.setVisible(false);
@@ -633,7 +900,7 @@ export class GameScene extends Phaser.Scene {
         const baseScale = displayHeight / body.height;
         body.setScale(baseScale);
 
-        const width = enemy.kind === "brute" ? 44 : 34;
+        const width = enemy.kind === "grunt" ? 40 : enemy.kind === "elf" ? 38 : 34;
         const barY = -displayHeight * 0.5 - 10;
 
         const hpBackground = this.add
@@ -662,13 +929,16 @@ export class GameScene extends Phaser.Scene {
       const pose = walkPose(enemy.travelled, stride);
 
       const facing = walkView(enemy.angle);
-      const key = `${WALK_ATLASES[enemy.kind]}-${facing}`;
+      const attacking = enemy.kind === "elf" && enemy.attackTimer > 0;
+      const key = attacking ? "elf-attack" : `${WALK_ATLASES[enemy.kind]}-${facing}`;
       // Frames are advanced by distance too, not by a timer, so the drawn footfalls stay
       // locked to the bob and to how fast the unit is actually moving.
       const count = frameCount(this, key);
-      const step = Math.floor((enemy.travelled / stride) * count);
+      const step = attacking
+        ? Math.min(count - 1, Math.floor((1 - enemy.attackTimer / ELF_ATTACK.animationTime) * count))
+        : Math.floor((enemy.travelled / stride) * count);
       view.body.setTexture(key, `walk_${((step % count) + count) % count}`);
-      view.body.setFlipX(facing === "side" && Math.abs(enemy.angle) > Math.PI / 2);
+      view.body.setFlipX((attacking || facing === "side") && Math.abs(enemy.angle) > Math.PI / 2);
 
       // Drawn legs already carry most of the motion, so the procedural pose is dialled right
       // back - at full strength the two read as a limp.
@@ -682,7 +952,7 @@ export class GameScene extends Phaser.Scene {
       );
 
       const ratio = Math.max(0, enemy.hp / enemy.maxHp);
-      const width = enemy.kind === "brute" ? 44 : 34;
+      const width = enemy.kind === "grunt" ? 40 : enemy.kind === "elf" ? 38 : 34;
       view.hpFill.setDisplaySize(width * ratio, 4);
       view.hpFill.setFillStyle(hex(ratio > 0.5 ? C.hpGood : ratio > 0.25 ? C.gold : C.hpBad));
 
@@ -704,7 +974,10 @@ export class GameScene extends Phaser.Scene {
       let view = this.towerViews.get(tower.id);
 
       if (!view) {
-        const body = this.add.image(0, 10, "tower", "walk_4").setOrigin(0.5, 1);
+        const body =
+          tower.kind === "bomb"
+            ? this.add.image(0, 10, "bomb-tower").setOrigin(0.5, 1)
+            : this.add.image(0, 10, "tower", "walk_4").setOrigin(0.5, 1);
         body.setScale(TOWER_DISPLAY_HEIGHT / body.height);
 
         // A notch per round, so the count is readable rather than approximate. The drawn
@@ -728,22 +1001,96 @@ export class GameScene extends Phaser.Scene {
           );
         }
 
-        const container = this.add.container(tower.x, tower.y, [body, ...pips]);
+        const fireTotal = SUPPLY.incendiaryAmmoMax;
+        const fireSpan =
+          fireTotal * FIRE_AMMO_PIP.width + (fireTotal - 1) * FIRE_AMMO_PIP.gap;
+        const firePips: Phaser.GameObjects.Rectangle[] = [];
+        for (let i = 0; i < fireTotal; i++) {
+          firePips.push(
+            this.add
+              .rectangle(
+                -fireSpan / 2 + i * (FIRE_AMMO_PIP.width + FIRE_AMMO_PIP.gap),
+                FIRE_AMMO_PIP.y,
+                FIRE_AMMO_PIP.width,
+                FIRE_AMMO_PIP.height,
+                0xff7a18,
+              )
+              .setOrigin(0, 0.5)
+              .setStrokeStyle(1, hex(C.outline))
+              .setVisible(false),
+          );
+        }
+
+        // A small red crossed-arrow badge makes an empty tower readable even when its tiny
+        // ammo pips are hard to inspect on a phone screen.
+        const dryBadgeBack = this.add
+          .circle(0, 0, 15, 0x9e2f25, 0.98)
+          .setStrokeStyle(3, hex(C.outline));
+        const dryBadgeArt = this.add.graphics();
+        dryBadgeArt.lineStyle(3, 0xf5dfad, 1);
+        dryBadgeArt.beginPath();
+        dryBadgeArt.moveTo(-8, 5);
+        dryBadgeArt.lineTo(8, -5);
+        dryBadgeArt.moveTo(5, -7);
+        dryBadgeArt.lineTo(8, -5);
+        dryBadgeArt.lineTo(6, -1);
+        dryBadgeArt.strokePath();
+        dryBadgeArt.lineStyle(4, 0xffd34e, 1);
+        dryBadgeArt.beginPath();
+        dryBadgeArt.moveTo(-9, -9);
+        dryBadgeArt.lineTo(9, 9);
+        dryBadgeArt.strokePath();
+        const dryBadge = this.add
+          .container(0, -101, [dryBadgeBack, dryBadgeArt])
+          .setVisible(false);
+
+        const container = this.add.container(tower.x, tower.y, [body, ...pips, ...firePips, dryBadge]);
         container.setScale(0.3);
         this.tweens.add({ targets: container, scale: 1, duration: 260, ease: "Back.easeOut" });
+        this.tweens.add({
+          targets: dryBadge,
+          scale: 1.12,
+          duration: 520,
+          ease: "Sine.easeInOut",
+          yoyo: true,
+          repeat: -1,
+        });
 
-        view = { container, body, pips };
+        view = { container, body, pips, firePips, dryBadge };
         this.towerViews.set(tower.id, view);
       }
 
       view.container.setDepth(groundDepth(tower.y));
-      view.body.setFrame(`walk_${towerAimFrame(tower.facing)}`);
+      if (tower.kind === "archer") {
+        view.body.setTexture(
+          tower.level === 2 ? "tower-2" : "tower",
+          `walk_${towerAimFrame(tower.facing)}`,
+        );
+      } else {
+        view.body.setTexture(tower.level === 2 ? "bomb-tower-2" : "bomb-tower");
+      }
 
       view.pips.forEach((pip, i) => {
         const loaded = i < tower.ammo;
         pip.setFillStyle(hex(loaded ? C.wood : C.hpBack));
         pip.setAlpha(loaded ? 1 : 0.45);
       });
+      view.firePips.forEach((pip, i) => {
+        const loaded = i < tower.incendiaryAmmo;
+        pip.setVisible(tower.incendiaryMagazineActive);
+        pip.setFillStyle(loaded ? 0xff7a18 : 0x4d2019);
+        pip.setAlpha(loaded ? 1 : 0.52);
+      });
+      view.dryBadge.setVisible(
+        tower.ammo <
+          (tower.kind === "bomb" && tower.level === 2
+            ? SUPPLY.bombAmmoPerShot
+            : SUPPLY.ammoPerShot) &&
+          tower.incendiaryAmmo <
+            (tower.kind === "bomb" && tower.level === 2
+              ? SUPPLY.bombAmmoPerShot
+              : SUPPLY.ammoPerShot),
+      );
     }
   }
 
@@ -752,13 +1099,23 @@ export class GameScene extends Phaser.Scene {
       let view = this.porterViews.get(porter.id);
 
       if (!view) {
-        const body = this.add.image(0, 0, `${PORTER_ATLAS}-side`, "walk_0");
-        const baseScale = PORTER_DISPLAY_HEIGHT / body.height;
+        const isAirship = porter.kind === "airship";
+        const body = isAirship
+          ? this.add.image(0, 0, "goblin-airship")
+          : this.add.image(0, 0, `${PORTER_ATLAS}-side`, "walk_0");
+        const baseScale = (isAirship ? AIRSHIP_DISPLAY_HEIGHT : PORTER_DISPLAY_HEIGHT) / body.height;
         body.setScale(baseScale);
 
-        const container = this.add.container(porter.x, porter.y, [body]);
+        // A strong crimson wash makes the specialist readable even before its cargo is
+        // visible; the old pale-orange tint was almost indistinguishable at phone scale.
+        if (porter.kind === "incendiary") body.setTint(0xff735a);
+        const fireCargo = this.add
+          .image(9, -31, "fire-ammo-crate")
+          .setDisplaySize(31, 31)
+          .setVisible(false);
+        const container = this.add.container(porter.x, porter.y, [body, fireCargo]);
 
-        view = { container, body, baseScale, walked: 0, lastX: porter.x, lastY: porter.y };
+        view = { container, body, fireCargo, baseScale, walked: 0, lastX: porter.x, lastY: porter.y };
         this.porterViews.set(porter.id, view);
       }
 
@@ -768,20 +1125,35 @@ export class GameScene extends Phaser.Scene {
       view.lastX = porter.x;
       view.lastY = porter.y;
 
-      view.container.setPosition(porter.x, porter.y).setDepth(groundDepth(porter.y));
+      const isAirship = porter.kind === "airship";
+      const airBob = isAirship
+        ? Math.sin(this.world.elapsed * 3 + porter.id) * (0.8 + porter.altitude * 2.2)
+        : 0;
+      view.container
+        .setPosition(porter.x, porter.y + (isAirship ? -18 - porter.altitude * 42 + airBob : 0))
+        .setDepth(isAirship ? DEPTH.projectile - 1 : groundDepth(porter.y));
 
       // Empty porters wait at the depot coordinate. Leaving their sprite there makes them
       // stand motionless over the roof, so hide them once they cross the doorway. A loaded
       // porter remains visible at the same coordinate because it is just walking back out.
       const insideDepot =
         porter.carrying === 0 &&
-        Math.hypot(porter.x - DEPOT.x, porter.y - DEPOT.y) <= DEPOT_INTERIOR_RADIUS;
+        Math.hypot(porter.x - this.world.depot.x, porter.y - this.world.depot.y) <= DEPOT_INTERIOR_RADIUS &&
+        (porter.kind !== "airship" || porter.altitude <= 0.01);
       view.container.setVisible(!insideDepot);
+      view.fireCargo.setVisible(porter.kind === "incendiary" && porter.carrying > 0);
+
+      if (isAirship) {
+        view.body.setFlipX(Math.abs(porter.angle) > Math.PI / 2);
+        view.body.setRotation(Math.sin(this.world.elapsed * 2.4 + porter.id) * 0.025);
+        continue;
+      }
 
       const facing = walkView(porter.angle);
-      const key = `${PORTER_ATLAS}-${facing}`;
+      const atlas = porter.fleeing ? PORTER_FLEE_ATLAS : PORTER_ATLAS;
+      const key = `${atlas}-${facing}`;
       const count = frameCount(this, key);
-      const stride = PORTER_DISPLAY_HEIGHT * STRIDE_FACTOR;
+      const stride = PORTER_DISPLAY_HEIGHT * (porter.fleeing ? 0.38 : STRIDE_FACTOR);
       const step = Math.floor((view.walked / stride) * count);
       view.body.setTexture(key, `walk_${((step % count) + count) % count}`);
       view.body.setFlipX(facing === "side" && Math.abs(porter.angle) > Math.PI / 2);
@@ -799,7 +1171,10 @@ export class GameScene extends Phaser.Scene {
   private refreshDepotGate(): void {
     let nearest = Infinity;
     for (const porter of this.world.porters) {
-      nearest = Math.min(nearest, Math.hypot(porter.x - DEPOT.x, porter.y - DEPOT.y));
+      nearest = Math.min(
+        nearest,
+        Math.hypot(porter.x - this.world.depot.x, porter.y - this.world.depot.y),
+      );
     }
 
     const frame =
@@ -823,8 +1198,17 @@ export class GameScene extends Phaser.Scene {
     }
 
     this.depotPorterPips.forEach((pip, i) => {
-      const hired = i < this.world.porters.length;
-      pip.setFillStyle(hex(hired ? C.accent : C.hpBack));
+      const porter = this.world.porters[i];
+      const hired = porter !== undefined;
+      pip.setFillStyle(
+        hired
+          ? porter.kind === "incendiary"
+            ? 0xff7a18
+            : porter.kind === "airship"
+              ? 0x8fd6ff
+              : hex(C.accent)
+          : hex(C.hpBack),
+      );
       pip.setAlpha(hired ? 1 : 0.45);
     });
   }
@@ -837,11 +1221,25 @@ export class GameScene extends Phaser.Scene {
       let sprite = this.projectileViews.get(projectile.id);
 
       if (!sprite) {
-        sprite = this.add.image(projectile.x, projectile.y, "arrow").setDepth(DEPTH.projectile);
+        sprite = this.add
+          .image(projectile.x, projectile.y, projectile.kind === "bomb" ? "bomb" : "arrow")
+          .setDepth(DEPTH.projectile);
+        if (projectile.kind === "bomb") {
+          sprite.setDisplaySize(22, (22 * sprite.height) / sprite.width);
+        }
+        if (projectile.incendiary) sprite.setTint(0xff9b32);
         this.projectileViews.set(projectile.id, sprite);
       }
 
-      sprite.setPosition(projectile.x, projectile.y).setRotation(projectile.angle);
+      if (projectile.kind === "bomb") {
+        const progress = Math.min(1, projectile.flight / Math.max(1, projectile.flightDistance));
+        const arc = Math.sin(progress * Math.PI) * 42;
+        sprite
+          .setPosition(projectile.x, projectile.y - arc)
+          .setRotation(progress * Math.PI * 4);
+      } else {
+        sprite.setPosition(projectile.x, projectile.y).setRotation(projectile.angle);
+      }
     }
 
     for (const [id, sprite] of this.projectileViews) {
@@ -872,12 +1270,20 @@ export class GameScene extends Phaser.Scene {
   private handleEvent(event: GameEvent): void {
     switch (event.type) {
       case "fire":
-        this.muzzleFlash(event.x, event.y, event.angle);
-        this.playEffect(SOUND_EFFECTS.arrowFlight.key, 0.34, 45);
+        if (event.towerKind === "archer") {
+          this.muzzleFlash(event.x, event.y, event.angle);
+          this.playEffect(SOUND_EFFECTS.arrowFlight.key, 0.34, 45);
+        }
+        if (event.incendiary) this.burst("spark", event.x, event.y, 1.1);
         break;
       case "hit":
-        this.burst("spark", event.x, event.y, 0.9);
-        this.playEffect(SOUND_EFFECTS.arrowHit.key, 0.42, 35);
+        this.burst("spark", event.x, event.y, event.incendiary ? 1.35 : 0.9);
+        if (event.towerKind === "archer") {
+          this.playEffect(SOUND_EFFECTS.arrowHit.key, 0.42, 35);
+        }
+        break;
+      case "explode":
+        this.explosion(event.x, event.y, event.radius);
         break;
       case "kill":
         this.burst("puff", event.x, event.y, 1.2);
@@ -893,16 +1299,55 @@ export class GameScene extends Phaser.Scene {
         this.playEffect(SOUND_EFFECTS.build.key, 0.52);
         this.closeBuildMenu();
         break;
+      case "upgrade":
+        this.burst("puff", event.x, event.y - 18, 2.0);
+        this.floatingText(event.x, event.y - 42, "LEVEL II", C.gold);
+        this.playEffect(SOUND_EFFECTS.build.key, 0.48);
+        this.closeBuildMenu();
+        break;
       case "deliver":
         this.burst("puff", event.x, event.y - 10, 1.0);
-        this.floatingText(event.x, event.y - 20, `+${event.amount}`, C.wood);
+        this.floatingText(
+          event.x,
+          event.y - 20,
+          `+${event.amount}`,
+          event.porterKind === "incendiary" ? "#ff8a22" : C.wood,
+        );
         break;
       case "hire":
         this.burst("puff", event.x, event.y, 1.4);
-        this.floatingText(event.x, event.y - 30, "+1", C.accent);
+        this.floatingText(
+          event.x,
+          event.y - 30,
+          "+1",
+          event.porterKind === "incendiary" ? "#ff8a22" : C.accent,
+        );
         this.playGoblinPhrase();
         this.closeBuildMenu();
         break;
+      case "porterAttacked":
+        this.burst("puff", event.x, event.y - 12, 1.25);
+        this.floatingText(event.x, event.y - 30, "CARGO LOST!", C.hpBad);
+        break;
+      case "elfFire": {
+        const angle = Math.atan2(event.targetY - event.y, event.targetX - event.x);
+        const arrow = this.add
+          .image(event.x, event.y, "arrow")
+          .setRotation(angle)
+          .setDepth(DEPTH.projectile);
+        this.tweens.add({
+          targets: arrow,
+          x: event.targetX,
+          y: event.targetY,
+          duration: 280,
+          ease: "Linear",
+          onComplete: () => {
+            this.burst("spark", event.targetX, event.targetY, 0.75);
+            arrow.destroy();
+          },
+        });
+        break;
+      }
       case "sell": {
         this.burst("puff", event.x, event.y - 20, 1.8);
         this.floatingText(event.x, event.y - 30, `+${event.refund}`, C.gold);
@@ -969,6 +1414,30 @@ export class GameScene extends Phaser.Scene {
       ease: "Quad.easeOut",
       onComplete: () => sprite.destroy(),
     });
+  }
+
+  private explosion(x: number, y: number, radius: number): void {
+    const blast = this.add
+      .circle(x, y, 12, 0xff8a22, 0.78)
+      .setStrokeStyle(5, 0xffd35a, 0.95)
+      .setDepth(DEPTH.effect);
+    const smoke = this.add.image(x, y, "puff").setDepth(DEPTH.effect).setScale(0.5);
+    this.tweens.add({
+      targets: blast,
+      radius,
+      alpha: 0,
+      duration: 280,
+      ease: "Quad.easeOut",
+      onComplete: () => blast.destroy(),
+    });
+    this.tweens.add({
+      targets: smoke,
+      scale: 1.8,
+      alpha: 0,
+      duration: 430,
+      onComplete: () => smoke.destroy(),
+    });
+    this.cameras.main.shake(110, 0.0025);
   }
 
   private floatingText(x: number, y: number, message: string, color: string): void {

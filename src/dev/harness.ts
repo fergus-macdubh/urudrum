@@ -14,7 +14,7 @@ import type { World } from "../sim/world";
  *   play([0,"p",1], 40)       buy pad 0, a porter, then pad 1; run to t=40s
  *   sweep([[0,1],[0,"p",1]])  headless balance runs, no rendering
  *   shoot('name')             PNG to tools/shots/ via `node tools/snapsink.mjs`
- *   balance.ENEMIES.grunt.hp  live-tune, picked up by the next new World()
+ *   balance.ENEMIES.peasant.hp  live-tune, picked up by the next new World()
  */
 export function installDevHarness(game: Phaser.Game): void {
   let clock = performance.now();
