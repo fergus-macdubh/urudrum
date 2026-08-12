@@ -1,6 +1,11 @@
 import Phaser from "phaser";
 import { ECONOMY, SUPPLY, VIEW } from "../sim/config";
-import { effectsVolume } from "../audio";
+import {
+  effectsVolume,
+  loadAudioSettings,
+  saveAudioSettings,
+  type AudioSettings,
+} from "../audio";
 import { C, hex } from "./palette";
 import type { GameScene } from "./GameScene";
 
@@ -18,6 +23,12 @@ const END_PANEL_ART = {
 } as const;
 
 const PAUSE_PANEL_ART = "pause-panel";
+
+const PAUSE_BUTTON_ART = {
+  settings: "menu-button-settings",
+  menu: "menu-button-main-menu",
+  back: "menu-button-back",
+} as const;
 
 const UI_CLICK = { key: "sfx-ui-click", url: "audio/ui-click.mp3" } as const;
 
@@ -40,6 +51,8 @@ export class HudScene extends Phaser.Scene {
 
   private overlay?: Phaser.GameObjects.Container;
   private pauseOverlay?: Phaser.GameObjects.Container;
+  private pauseContent?: Phaser.GameObjects.Container;
+  private pausePage: "menu" | "settings" = "menu";
   private lastStatus: string = "playing";
   private lastLives = -1;
 
@@ -56,6 +69,9 @@ export class HudScene extends Phaser.Scene {
     }
     if (!this.textures.exists(PAUSE_PANEL_ART)) {
       this.load.image(PAUSE_PANEL_ART, `sprites/${PAUSE_PANEL_ART}.png`);
+    }
+    for (const key of Object.values(PAUSE_BUTTON_ART)) {
+      if (!this.textures.exists(key)) this.load.image(key, `sprites/${key}.png`);
     }
     if (!this.cache.audio.exists(UI_CLICK.key)) this.load.audio(UI_CLICK.key, UI_CLICK.url);
     for (const effect of Object.values(END_SOUNDS)) {
@@ -78,6 +94,8 @@ export class HudScene extends Phaser.Scene {
       this.overlay = undefined;
       this.pauseOverlay?.destroy();
       this.pauseOverlay = undefined;
+      this.pauseContent = undefined;
+      this.pausePage = "menu";
       this.lastStatus = "playing";
     });
   }
@@ -86,9 +104,14 @@ export class HudScene extends Phaser.Scene {
     if (!this.game_?.world || this.game_.world.status !== "playing") return;
 
     if (this.scene.isPaused("Game")) {
+      if (this.pausePage === "settings") {
+        this.showPauseMenu();
+        return;
+      }
       this.scene.resume("Game");
       this.pauseOverlay?.destroy();
       this.pauseOverlay = undefined;
+      this.pauseContent = undefined;
       return;
     }
 
@@ -111,7 +134,153 @@ export class HudScene extends Phaser.Scene {
       .container(0, 0, [dim, panel])
       .setDepth(200)
       .setAlpha(0);
+    this.showPauseMenu();
     this.tweens.add({ targets: this.pauseOverlay, alpha: 1, duration: 140 });
+  }
+
+  private replacePauseContent(): Phaser.GameObjects.Container {
+    this.pauseContent?.destroy(true);
+    this.pauseContent = this.add.container(0, 0);
+    this.pauseOverlay?.add(this.pauseContent);
+    return this.pauseContent;
+  }
+
+  private showPauseMenu(): void {
+    this.pausePage = "menu";
+    const content = this.replacePauseContent();
+    this.pauseArtButton(content, VIEW.width / 2 - 145, 482, PAUSE_BUTTON_ART.settings, 250, () =>
+      this.showPauseSettings(),
+    );
+    this.pauseArtButton(content, VIEW.width / 2 + 145, 482, PAUSE_BUTTON_ART.menu, 250, () => {
+      this.scene.stop("Game");
+      this.scene.start("Menu");
+    });
+  }
+
+  private showPauseSettings(): void {
+    this.pausePage = "settings";
+    const content = this.replacePauseContent();
+    const panel = this.add.graphics();
+    panel.fillStyle(hex(C.outline), 0.98).fillRoundedRect(350, 205, 580, 340, 24);
+    panel.fillStyle(hex(C.panel), 0.99).fillRoundedRect(360, 215, 560, 320, 18);
+    panel.lineStyle(4, hex(C.goldDark), 1).strokeRoundedRect(368, 223, 544, 304, 14);
+    content.add(panel);
+    content.add(
+      this.add
+        .text(VIEW.width / 2, 258, "SOUND SETTINGS", {
+          fontFamily: "'Bungee', 'Arial Black', sans-serif",
+          fontSize: "34px",
+          color: C.gold,
+          stroke: C.outline,
+          strokeThickness: 7,
+        })
+        .setOrigin(0.5),
+    );
+
+    const settings = loadAudioSettings();
+    this.pauseVolumeControl(content, 340, "MUSIC", "music", settings);
+    this.pauseVolumeControl(content, 410, "EFFECTS", "effects", settings);
+    this.pauseArtButton(content, VIEW.width / 2, 493, PAUSE_BUTTON_ART.back, 170, () =>
+      this.showPauseMenu(),
+    );
+  }
+
+  private pauseVolumeControl(
+    container: Phaser.GameObjects.Container,
+    y: number,
+    label: string,
+    kind: keyof AudioSettings,
+    settings: AudioSettings,
+  ): void {
+    const row = this.add.graphics();
+    row.fillStyle(hex(C.woodDark), 0.62).fillRoundedRect(385, y - 27, 510, 54, 12);
+    row.lineStyle(2, hex(C.goldDark), 0.9).strokeRoundedRect(385, y - 27, 510, 54, 12);
+    container.add(row);
+    container.add(
+      this.add
+        .text(410, y, label, {
+          fontFamily: "'Bungee', 'Arial Black', sans-serif",
+          fontSize: "19px",
+          color: C.parchment,
+          stroke: C.outline,
+          strokeThickness: 4,
+        })
+        .setOrigin(0, 0.5),
+    );
+
+    const value = this.add
+      .text(875, y, "", {
+        fontFamily: "'Bungee', 'Arial Black', sans-serif",
+        fontSize: "17px",
+        color: C.gold,
+        stroke: C.outline,
+        strokeThickness: 3,
+      })
+      .setOrigin(1, 0.5);
+    const mute = this.add
+      .text(570, y, "×", {
+        fontFamily: "'Bungee', 'Arial Black', sans-serif",
+        fontSize: "23px",
+        color: C.hpBad,
+        stroke: C.outline,
+        strokeThickness: 3,
+      })
+      .setOrigin(0.5);
+    container.add([value, mute]);
+
+    const pips: Phaser.GameObjects.Rectangle[] = [];
+    for (let index = 0; index < 10; index++) {
+      const x = 600 + index * 22;
+      const pip = this.add.rectangle(x, y, 15, 25, hex(C.stoneDark)).setStrokeStyle(2, hex(C.outline));
+      const hit = this.add.zone(x, y, 22, 42).setInteractive({ useHandCursor: true });
+      container.add([pip, hit]);
+      pips.push(pip);
+      hit.on("pointerdown", () => {
+        settings[kind] = (index + 1) / 10;
+        saveAudioSettings(settings);
+        this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
+        refresh();
+      });
+    }
+
+    const muteHit = this.add.zone(570, y, 34, 42).setInteractive({ useHandCursor: true });
+    container.add(muteHit);
+    muteHit.on("pointerdown", () => {
+      settings[kind] = 0;
+      saveAudioSettings(settings);
+      if (kind === "effects") this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
+      refresh();
+    });
+
+    const refresh = () => {
+      const active = Math.round(settings[kind] * 10);
+      pips.forEach((pip, index) => pip.setFillStyle(hex(index < active ? C.gold : C.stoneDark)));
+      mute.setColor(active === 0 ? C.gold : C.hpBad);
+      value.setText(active === 0 ? "MUTE" : `${active * 10}%`);
+    };
+    refresh();
+  }
+
+  private pauseArtButton(
+    container: Phaser.GameObjects.Container,
+    x: number,
+    y: number,
+    texture: string,
+    width: number,
+    onPress: () => void,
+  ): void {
+    const image = this.add.image(x, y, texture);
+    image.setDisplaySize(width, (width * image.height) / image.width);
+    const hit = this.add
+      .zone(x, y, image.displayWidth, image.displayHeight)
+      .setInteractive({ useHandCursor: true });
+    container.add([image, hit]);
+    hit.on("pointerover", () => image.setTint(0xffefc2));
+    hit.on("pointerout", () => image.clearTint());
+    hit.on("pointerdown", () => {
+      this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
+      onPress();
+    });
   }
 
   private buildBanner(): void {
