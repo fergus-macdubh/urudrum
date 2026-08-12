@@ -1,8 +1,15 @@
 import Phaser from "phaser";
+import {
+  effectsVolume,
+  loadAudioSettings,
+  saveAudioSettings,
+  type AudioSettings,
+} from "../audio";
 import { createSave, loadSaveSlots, markLevelStarted } from "../save";
 import type { SaveSlot } from "../save";
 import { VIEW } from "../sim/config";
 import { C, hex } from "./palette";
+import type { MusicScene } from "./MusicScene";
 
 const MENU_FONT = "'Bungee', 'Arial Black', sans-serif";
 
@@ -13,6 +20,7 @@ const MENU_BUTTON_ART = {
   new: "menu-button-new",
   continue: "menu-button-continue",
   wiki: "menu-button-wiki",
+  settings: "menu-button-settings",
   exit: "menu-button-exit",
   slot1: "menu-button-slot-1",
   slot2: "menu-button-slot-2",
@@ -144,12 +152,20 @@ export class MenuScene extends Phaser.Scene {
 
     this.showMainMenu();
 
+    // Menu is the first scene and is guaranteed to exist before the first user gesture.
+    // Starting the persistent music scene here avoids missing Phaser's very early READY
+    // event; MusicScene itself waits for the browser audio unlock before playing.
+    if (!this.scene.isActive("Music")) this.scene.launch("Music");
+    this.input.on("pointerdown", () => {
+      (this.scene.get("Music") as MusicScene | undefined)?.beginPlayback();
+    });
+
     // Every nested menu gives Escape exactly the same destination as its visible Back
     // button. MenuScene sleeps once gameplay starts, so GameScene keeps ownership of Escape
     // for pausing the battle.
     this.input.keyboard?.on("keydown-ESC", (event: KeyboardEvent) => {
       if (event.repeat || !this.escapeAction) return;
-      this.sound.play(UI_CLICK.key, { volume: 0.24 });
+      this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
       this.escapeAction();
     });
 
@@ -177,10 +193,16 @@ export class MenuScene extends Phaser.Scene {
     return this.screen;
   }
 
-  private title(container: Phaser.GameObjects.Container, title: string, subtitle: string): void {
+  private title(
+    container: Phaser.GameObjects.Container,
+    title: string,
+    subtitle: string,
+    titleY = 138,
+    subtitleY = 196,
+  ): void {
     container.add(
       this.add
-        .text(VIEW.width / 2, 138, title, {
+        .text(VIEW.width / 2, titleY, title, {
           fontFamily: MENU_FONT,
           fontSize: "50px",
           color: C.gold,
@@ -192,7 +214,7 @@ export class MenuScene extends Phaser.Scene {
     );
     container.add(
       this.add
-        .text(VIEW.width / 2, 196, subtitle, {
+        .text(VIEW.width / 2, subtitleY, subtitle, {
           fontFamily: MENU_FONT,
           fontSize: "16px",
           color: C.parchment,
@@ -247,7 +269,7 @@ export class MenuScene extends Phaser.Scene {
     hitArea.on("pointerover", () => sign.setTint(0xffefc2));
     hitArea.on("pointerout", () => sign.clearTint());
     hitArea.on("pointerdown", () => {
-      this.sound.play(UI_CLICK.key, { volume: 0.24 });
+      this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
       this.tweens.add({
         targets: button,
         scale: 0.94,
@@ -279,15 +301,108 @@ export class MenuScene extends Phaser.Scene {
       !hasSave,
       () => this.showSlots("continue"),
     );
-    this.artButton(screen, VIEW.width / 2, 505, MENU_BUTTON_ART.wiki, 360, false, () =>
+    this.artButton(screen, VIEW.width / 2, 490, MENU_BUTTON_ART.wiki, 330, false, () =>
       this.showWikiCategories(),
     );
-    this.artButton(screen, VIEW.width / 2, 620, MENU_BUTTON_ART.exit, 270, false, () =>
+    this.artButton(screen, VIEW.width / 2, 590, MENU_BUTTON_ART.settings, 330, false, () =>
+      this.showSoundSettings(),
+    );
+    this.artButton(screen, VIEW.width / 2, 665, MENU_BUTTON_ART.exit, 230, false, () =>
       this.showExitScreen(),
     );
 
     screen.setAlpha(0);
     this.tweens.add({ targets: screen, alpha: 1, duration: 220 });
+  }
+
+  private showSoundSettings(): void {
+    this.escapeAction = () => this.showMainMenu();
+    const screen = this.replaceScreen();
+    this.title(screen, "SOUND SETTINGS", "Adjust music and effects");
+    const settings = loadAudioSettings();
+    this.volumeControl(screen, 300, "MUSIC", "music", settings);
+    this.volumeControl(screen, 445, "EFFECTS", "effects", settings);
+    this.backButton(screen, () => this.showMainMenu());
+  }
+
+  private volumeControl(
+    container: Phaser.GameObjects.Container,
+    y: number,
+    label: string,
+    kind: keyof AudioSettings,
+    settings: AudioSettings,
+  ): void {
+    const panel = this.add.graphics();
+    panel.fillStyle(hex(C.outline), 0.96).fillRoundedRect(330, y - 58, 620, 116, 22);
+    panel.fillStyle(hex(C.panel), 0.97).fillRoundedRect(340, y - 48, 600, 96, 16);
+    panel.lineStyle(3, hex(C.goldDark), 1).strokeRoundedRect(346, y - 42, 588, 84, 12);
+    container.add(panel);
+
+    container.add(
+      this.add
+        .text(385, y, label, {
+          fontFamily: MENU_FONT,
+          fontSize: "25px",
+          color: C.parchment,
+          stroke: C.outline,
+          strokeThickness: 5,
+        })
+        .setOrigin(0, 0.5),
+    );
+
+    const value = this.add
+      .text(916, y, "", {
+        fontFamily: MENU_FONT,
+        fontSize: "22px",
+        color: C.gold,
+        stroke: C.outline,
+        strokeThickness: 4,
+      })
+      .setOrigin(1, 0.5);
+    container.add(value);
+
+    const pips: Phaser.GameObjects.Rectangle[] = [];
+    const mute = this.add
+      .text(580, y, "×", {
+        fontFamily: MENU_FONT,
+        fontSize: "27px",
+        color: C.hpBad,
+        stroke: C.outline,
+        strokeThickness: 4,
+      })
+      .setOrigin(0.5);
+    container.add(mute);
+    for (let i = 0; i < 10; i++) {
+      const pip = this.add
+        .rectangle(614 + i * 22, y, 15, 28, hex(C.stoneDark))
+        .setStrokeStyle(2, hex(C.outline));
+      const hit = this.add.zone(614 + i * 22, y, 22, 48).setInteractive({ useHandCursor: true });
+      container.add([pip, hit]);
+      pips.push(pip);
+      hit.on("pointerdown", () => {
+        settings[kind] = (i + 1) / 10;
+        saveAudioSettings(settings);
+        this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
+        refresh();
+      });
+    }
+
+    const muteHit = this.add.zone(580, y, 32, 48).setInteractive({ useHandCursor: true });
+    container.add(muteHit);
+    muteHit.on("pointerdown", () => {
+      settings[kind] = 0;
+      saveAudioSettings(settings);
+      if (kind === "effects") this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
+      refresh();
+    });
+
+    const refresh = () => {
+      const active = Math.round(settings[kind] * 10);
+      pips.forEach((pip, index) => pip.setFillStyle(hex(index < active ? C.gold : C.stoneDark)));
+      mute.setColor(active === 0 ? C.gold : C.hpBad);
+      value.setText(active === 0 ? "MUTE" : `${active * 10}%`);
+    };
+    refresh();
   }
 
   private showSlots(mode: SlotMode): void {
@@ -336,87 +451,41 @@ export class MenuScene extends Phaser.Scene {
       screen,
       "SELECT LEVEL",
       `${mode === "new" ? "New Game" : "Continue"} · Slot ${slotIndex + 1}`,
+      72,
+      116,
     );
 
-    const completed = mode === "continue" && save?.completedLevels.includes(1);
-    this.artButton(
-      screen,
-      VIEW.width / 2,
-      165,
-      MENU_BUTTON_ART.level1,
-      310,
-      false,
-      () => this.startLevel(mode, slotIndex, 1),
-      completed ? "GREEN VALLEY · COMPLETED" : "GREEN VALLEY",
-    );
+    const levels = [
+      { number: 1, texture: MENU_BUTTON_ART.level1, name: "GREEN VALLEY" },
+      { number: 2, texture: MENU_BUTTON_ART.level2, name: "FORKED PASS" },
+      { number: 3, texture: MENU_BUTTON_ART.level3, name: "CROSSED ROADS" },
+      { number: 4, texture: MENU_BUTTON_ART.level4, name: "ELVEN AMBUSH" },
+      { number: 5, texture: MENU_BUTTON_ART.level5, name: "IRONWORKS PASS" },
+    ] as const;
 
-    const level2Unlocked = mode === "continue" && (save?.unlockedLevel ?? 1) >= 2;
-    const level2Completed = mode === "continue" && save?.completedLevels.includes(2);
-    this.artButton(
-      screen,
-      VIEW.width / 2,
-      260,
-      MENU_BUTTON_ART.level2,
-      310,
-      !level2Unlocked,
-      () => this.startLevel(mode, slotIndex, 2),
-      level2Completed
-        ? "FORKED PASS · COMPLETED"
-        : level2Unlocked
-          ? "FORKED PASS"
-          : "COMPLETE LEVEL 1 TO UNLOCK",
-    );
+    levels.forEach((level, index) => {
+      const unlocked = level.number === 1 ||
+        (mode === "continue" && (save?.unlockedLevel ?? 1) >= level.number);
+      const completed = mode === "continue" && save?.completedLevels.includes(level.number);
+      const column = index % 2;
+      const row = Math.floor(index / 2);
+      const subtitle = completed
+        ? `${level.name} · COMPLETED`
+        : unlocked
+          ? level.name
+          : `COMPLETE LEVEL ${level.number - 1} TO UNLOCK`;
 
-    const level3Unlocked = mode === "continue" && (save?.unlockedLevel ?? 1) >= 3;
-    const level3Completed = mode === "continue" && save?.completedLevels.includes(3);
-    this.artButton(
-      screen,
-      VIEW.width / 2,
-      355,
-      MENU_BUTTON_ART.level3,
-      310,
-      !level3Unlocked,
-      () => this.startLevel(mode, slotIndex, 3),
-      level3Completed
-        ? "CROSSED ROADS · COMPLETED"
-        : level3Unlocked
-          ? "CROSSED ROADS"
-          : "COMPLETE LEVEL 2 TO UNLOCK",
-    );
-
-    const level4Unlocked = mode === "continue" && (save?.unlockedLevel ?? 1) >= 4;
-    const level4Completed = mode === "continue" && save?.completedLevels.includes(4);
-    this.artButton(
-      screen,
-      VIEW.width / 2,
-      450,
-      MENU_BUTTON_ART.level4,
-      310,
-      !level4Unlocked,
-      () => this.startLevel(mode, slotIndex, 4),
-      level4Completed
-        ? "ELVEN AMBUSH · COMPLETED"
-        : level4Unlocked
-          ? "ELVEN AMBUSH"
-          : "COMPLETE LEVEL 3 TO UNLOCK",
-    );
-
-    const level5Unlocked = mode === "continue" && (save?.unlockedLevel ?? 1) >= 5;
-    const level5Completed = mode === "continue" && save?.completedLevels.includes(5);
-    this.artButton(
-      screen,
-      VIEW.width / 2,
-      545,
-      MENU_BUTTON_ART.level5,
-      310,
-      !level5Unlocked,
-      () => this.startLevel(mode, slotIndex, 5),
-      level5Completed
-        ? "IRONWORKS PASS · COMPLETED"
-        : level5Unlocked
-          ? "IRONWORKS PASS"
-          : "COMPLETE LEVEL 4 TO UNLOCK",
-    );
+      this.artButton(
+        screen,
+        column === 0 ? 445 : 835,
+        220 + row * 150,
+        level.texture,
+        350,
+        !unlocked,
+        () => this.startLevel(mode, slotIndex, level.number),
+        subtitle,
+      );
+    });
 
     this.backButton(screen, () => this.showSlots(mode));
   }
@@ -478,7 +547,7 @@ export class MenuScene extends Phaser.Scene {
     hitArea.on("pointerover", () => wood.setAlpha(0.88));
     hitArea.on("pointerout", () => wood.setAlpha(1));
     hitArea.on("pointerdown", () => {
-      this.sound.play(UI_CLICK.key, { volume: 0.24 });
+      this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
       this.tweens.add({ targets: row, scale: 0.96, duration: 60, yoyo: true, onComplete: onPress });
     });
   }

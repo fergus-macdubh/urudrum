@@ -1,5 +1,6 @@
 import Phaser from "phaser";
 import { ECONOMY, SUPPLY, VIEW } from "../sim/config";
+import { effectsVolume } from "../audio";
 import { C, hex } from "./palette";
 import type { GameScene } from "./GameScene";
 
@@ -227,7 +228,9 @@ export class HudScene extends Phaser.Scene {
 
   private showEndPanel(won: boolean): void {
     if (won) this.game_.recordVictory();
-    this.sound.play(won ? END_SOUNDS.victory.key : END_SOUNDS.defeat.key, { volume: 0.62 });
+    this.sound.play(won ? END_SOUNDS.victory.key : END_SOUNDS.defeat.key, {
+      volume: effectsVolume(0.62),
+    });
 
     const cx = VIEW.width / 2;
     const cy = VIEW.height / 2;
@@ -271,7 +274,7 @@ export class HudScene extends Phaser.Scene {
       hit.on("pointerover", () => image.setTint(0xffefc2));
       hit.on("pointerout", () => image.clearTint());
       hit.on("pointerdown", () => {
-        this.sound.play(UI_CLICK.key, { volume: 0.24 });
+        this.sound.play(UI_CLICK.key, { volume: effectsVolume(0.24) });
         onPress();
       });
       return [image, hit] as const;

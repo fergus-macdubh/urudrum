@@ -1,4 +1,5 @@
 import Phaser from "phaser";
+import { effectsVolume } from "../audio";
 import { BOMB_TOWER, ELF_ATTACK, SUPPLY, TOWER, TOWER_UPGRADES, VIEW } from "../sim/config";
 import type { EnemyKind } from "../sim/config";
 import type { GameEvent } from "../sim/types";
@@ -45,6 +46,7 @@ const SOUND_EFFECTS = {
     { key: "sfx-hire-goblin-5", url: "audio/hire-goblin-5.mp3" },
   ],
   sell: { key: "sfx-sell-tower", url: "audio/sell-tower.mp3" },
+  explosion: { key: "sfx-explosion-impact", url: "audio/explosion-impact.mp3" },
 } as const;
 
 const DEPOT_DISPLAY_HEIGHT = 130;
@@ -1284,6 +1286,7 @@ export class GameScene extends Phaser.Scene {
         break;
       case "explode":
         this.explosion(event.x, event.y, event.radius);
+        this.playEffect(SOUND_EFFECTS.explosion.key, 0.7, 90);
         break;
       case "kill":
         this.burst("puff", event.x, event.y, 1.2);
@@ -1374,7 +1377,7 @@ export class GameScene extends Phaser.Scene {
     const now = this.time.now;
     if (now - (this.lastSoundAt.get(key) ?? -Infinity) < minimumGapMs) return;
     this.lastSoundAt.set(key, now);
-    this.sound.play(key, { volume });
+    this.sound.play(key, { volume: effectsVolume(volume) });
   }
 
   private playGoblinPhrase(): void {

@@ -13,6 +13,9 @@ owner from Pixabay and are used under the Pixabay Content License.
 | `hire-goblin-1.mp3` through `hire-goblin-5.mp3` | [Great Goblin Giving Speech by freesound_community](https://pixabay.com/sound-effects/great-goblin-giving-speech-26303/) | Five phrases cut at natural pauses and normalized independently. |
 | `victory.mp3` | [Drum Roll for Victory by Scratchonix](https://pixabay.com/sound-effects/drum-roll-for-victory-366448/) | Extracted from 4–7 seconds, normalized, and faded at the cut points. |
 | `defeat.mp3` | [Losing Horn by u_l5xum8z250](https://pixabay.com/sound-effects/losing-horn-313723/) | Full source used, normalized, with a short fade at the end. |
+| `explosion-impact.mp3` | Owner-provided Pixabay download `explosion-impact.mp3` | Silent tail trimmed, impact normalized, and the final 0.3 seconds faded. |
+| `bg-music-1.mp3` | Owner-provided Pixabay download `bg-misuc-1.mp3` | Stable 30–98 second section extracted and normalized to -22 LUFS. |
+| `bg-music-2.mp3` | Owner-provided Pixabay download `bg-music-2.mp3` | Stable 70–140 second section extracted and normalized to -22 LUFS. The game crossfades between both music clips. |
 
 Source files remain untouched in the owner's Downloads directory. Edited clips are loudness
 normalized, lightly faded at cut points, and encoded as 128 kbps MP3 for mobile delivery.

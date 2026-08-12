@@ -3,6 +3,7 @@ import { VIEW } from "./sim/config";
 import { GameScene } from "./render/GameScene";
 import { HudScene } from "./render/HudScene";
 import { MenuScene } from "./render/MenuScene";
+import { MusicScene } from "./render/MusicScene";
 import { C, hex } from "./render/palette";
 
 const game = new Phaser.Game({
@@ -22,7 +23,7 @@ const game = new Phaser.Game({
   },
   // Only the menu auto-starts. It launches Game after a save slot and level are selected;
   // Game then launches Hud above the board.
-  scene: [MenuScene, GameScene, HudScene],
+  scene: [MenuScene, MusicScene, GameScene, HudScene],
 });
 
 // Console harness for driving and inspecting the game. Dropped from production builds.
