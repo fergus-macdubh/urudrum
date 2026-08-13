@@ -25,6 +25,7 @@ const END_PANEL_ART = {
 const PAUSE_PANEL_ART = "pause-panel";
 
 const PAUSE_BUTTON_ART = {
+  restart: "menu-button-restart-level",
   settings: "menu-button-settings",
   menu: "menu-button-main-menu",
   back: "menu-button-back",
@@ -148,10 +149,18 @@ export class HudScene extends Phaser.Scene {
   private showPauseMenu(): void {
     this.pausePage = "menu";
     const content = this.replacePauseContent();
-    this.pauseArtButton(content, VIEW.width / 2 - 145, 482, PAUSE_BUTTON_ART.settings, 250, () =>
+    this.pauseArtButton(content, VIEW.width / 2 - 280, 482, PAUSE_BUTTON_ART.restart, 245, () => {
+      this.pauseOverlay?.destroy();
+      this.pauseOverlay = undefined;
+      this.pauseContent = undefined;
+      this.lastStatus = "playing";
+      this.lastLives = -1;
+      this.game_.restart();
+    });
+    this.pauseArtButton(content, VIEW.width / 2, 482, PAUSE_BUTTON_ART.settings, 245, () =>
       this.showPauseSettings(),
     );
-    this.pauseArtButton(content, VIEW.width / 2 + 145, 482, PAUSE_BUTTON_ART.menu, 250, () => {
+    this.pauseArtButton(content, VIEW.width / 2 + 280, 482, PAUSE_BUTTON_ART.menu, 245, () => {
       this.scene.stop("Game");
       this.scene.start("Menu");
     });
